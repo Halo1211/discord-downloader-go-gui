@@ -38,6 +38,9 @@
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
+!assets/
+!assets/*.svg
+!assets/*.png
 
 # Local release artifacts. Build outputs and release bundles must stay local.
 release/

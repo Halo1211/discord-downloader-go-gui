@@ -3,6 +3,11 @@
 This release packages the maintained GUI fork at
 `Halo1211/discord-downloader-go-gui`.
 
+## Presentation
+
+- Refreshed the README with a dashboard preview, release badges, and a new repository logo.
+- Added a clean vector logo asset that can be reused in project documentation and packaging.
+
 ## Highlights
 
 - Windows WebView2 dashboard with optional browser fallback.

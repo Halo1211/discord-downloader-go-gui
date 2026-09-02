@@ -1,6 +1,22 @@
-# Discord Downloader Go GUI
+<p align="center">
+  <img src="assets/discord-downloader-go-logo.svg" alt="Discord Downloader Go GUI logo" width="144">
+</p>
 
-![CI](https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml/badge.svg)
+<h1 align="center">Discord Downloader Go GUI</h1>
+
+<p align="center">
+  A focused desktop dashboard and Discord bot for reliable media archiving.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml"><img src="https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/Halo1211/discord-downloader-go-gui/releases/latest"><img src="https://img.shields.io/github/v/release/Halo1211/discord-downloader-go-gui?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Halo1211/discord-downloader-go-gui" alt="License"></a>
+</p>
+
+<p align="center">
+  <img src="assets/dashboard.png" alt="Archive Relay dashboard showing archive scope, transfer status, and scan activity" width="960">
+</p>
 
 A community-maintained Discord bot and desktop dashboard for downloading files
 from Discord in real time and for archiving older channel history. The project
