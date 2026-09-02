@@ -3,6 +3,11 @@
 All examples use placeholders. Replace IDs, paths, and the bot token before
 starting the application.
 
+The repository's [`settings.example.json`](../settings.example.json) is a
+complete starter template with the main global, GUI, history, filter, logging,
+and source options. The smaller examples below show common ways to narrow the
+configuration after the first run.
+
 ## Minimal bot setup
 
 ```json

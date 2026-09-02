@@ -19,7 +19,7 @@ discovery.
 
 ## Install a release
 
-Download the matching asset from the
+Download the single Windows amd64 executable from the
 [latest release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest)
 and extract it to its own directory. Keep `settings.json`, `cache/`,
 `database/`, and downloaded media beside the executable so relative paths are

@@ -9,6 +9,7 @@ This release packages the maintained GUI fork at
 - Added a clean vector logo asset that can be reused in project documentation and packaging.
 - Embedded the repository logo directly into the desktop dashboard so the program is self-contained.
 - The embedded logo adapts its colors to the selected dashboard theme.
+- Expanded `settings.example.json` with safe, detailed examples for global and scoped rules.
 
 ## Highlights
 

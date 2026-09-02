@@ -5,6 +5,12 @@ validates it, writes it atomically, and keeps a `.bak` copy of the previous
 file. Restart the application after changing launch-only GUI options such as
 the address.
 
+For a complete safe starter file, copy
+[`settings.example.json`](../settings.example.json) and replace every
+`REPLACE_WITH_...` placeholder. The template follows the configuration model
+documented by the original project while using only genuine Discord bot
+authentication for this maintained fork.
+
 ## Required values
 
 At minimum, configure a bot token and a destination rule:
