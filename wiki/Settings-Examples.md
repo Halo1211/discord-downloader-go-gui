@@ -37,7 +37,7 @@ configuration after the first run.
     {
       "server": "222222222222222222",
       "destination": "D:\\Discord Archive\\Projects",
-      "subfolders": "{{fileType}}"
+      "subfolders": ["{{fileType}}"]
     }
   ]
 }
@@ -66,3 +66,30 @@ configuration after the first run.
 2. Confirm the destination and filename templates.
 3. Enable additional media types one at a time.
 4. Keep a backup of `database/` before destructive database operations.
+
+## Alias and blacklist example
+
+Aliases make history commands easier to read. Server and global rules can also
+exclude channels, categories, users, or servers:
+
+```json
+{
+  "credentials": { "token": "YOUR_DISCORD_BOT_TOKEN" },
+  "all": {
+    "destination": "D:\\Discord Archive",
+    "allBlacklistChannels": ["444444444444444444"]
+  },
+  "servers": [
+    {
+      "server": "555555555555555555",
+      "alias": "team",
+      "destination": "D:\\Discord Archive\\Team",
+      "serverBlacklist": ["666666666666666666"]
+    }
+  ]
+}
+```
+
+Run `ddg history team` after the bot has validated the server. Use the GUI
+source editor to add channel rules and let it create the automatic
+`server/channel` subfolder layout.

@@ -10,6 +10,9 @@ This release packages the maintained GUI fork at
 - Embedded the repository logo directly into the desktop dashboard so the program is self-contained.
 - The embedded logo adapts its colors to the selected dashboard theme.
 - Expanded `settings.example.json` with safe, detailed examples for global and scoped rules.
+- Expanded the English version-controlled wiki with code-accurate commands,
+  configuration reference, CLI/GUI security guidance, history recovery,
+  troubleshooting, official Discord references, and attributed historical media.
 
 ## Highlights
 

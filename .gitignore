@@ -35,6 +35,9 @@
 !docs/*.md
 !wiki/
 !wiki/*.md
+!wiki/assets/
+!wiki/assets/*.png
+!wiki/assets/*.jpg
 !settings.example.json
 !RELEASE_NOTES.md
 !.github/

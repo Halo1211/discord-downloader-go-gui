@@ -5,6 +5,12 @@ events. A scan resolves its target, fetches message pages, applies the normal
 source and file filters, and sends selected files through the bounded worker
 queue.
 
+History requests are limited to `historyRequestCount` messages per page
+(maximum 100). `historyDownloadWorkers` controls file transfers inside a job,
+while `historyMaxJobs` controls the number of channel jobs that can run at the
+same time. Start conservatively because Discord rate limits and local disk I/O
+remain the limiting factors.
+
 ## Checkpoints
 
 Active checkpoints are stored under `cache/history/`. A checkpoint advances
@@ -25,3 +31,19 @@ a request already being written may finish before the job becomes cancelled.
 For a failed job, check permissions, rate limits, disk space, destination
 access, and the source rule. Re-running a scan reuses its checkpoint when
 possible. Discord CDN signatures are normalized for deduplication.
+
+## Completion states
+
+The application reports waiting, currently downloading, cancellation requested,
+cancelled, message-history permission errors, request failures, no more
+messages, completion at a `before` boundary, and completion at a `since`
+boundary. A completed status means the scan reached its boundary; it does not
+guarantee that every candidate file was saved if filters or download errors
+excluded individual items.
+
+## Automatic history
+
+Set `autoHistory: true` on a source rule to queue it after the Discord session
+is ready. Use `autoHistoryBefore` and `autoHistorySince` for a bounded first
+archive. `autoHistoryExit` can stop a one-shot process after startup jobs, which
+is useful for a scheduled archive but should be tested before automation.

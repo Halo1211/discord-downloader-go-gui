@@ -15,6 +15,12 @@ bot-account requirements.
 - [Commands](Commands.md) — bot commands and their permissions.
 - [History](History.md) — archive older messages, checkpoints, and recovery.
 - [Sources](Sources.md) — supported media sources and resolver limitations.
+- [Configuration Reference](Configuration-Reference.md) — complete option groups,
+  defaults, limits, and template placeholders.
+- [CLI and GUI](CLI-and-GUI.md) — runtime flags, dashboard workflow, and local
+  security model.
+- [Reference Media](Media-References.md) — dashboard screenshot, original wiki
+  attribution, and the historical tutorial link.
 - [Troubleshooting](Troubleshooting.md) — common setup and runtime problems.
 - [Development](Development.md) — tests, builds, and release packaging.
 
