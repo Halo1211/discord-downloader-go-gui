@@ -1,4 +1,4 @@
-# Release Notes — v2.6.2
+# Release Notes — v2.6.3
 
 This release packages the maintained GUI fork at
 `Halo1211/discord-downloader-go-gui`.
@@ -21,7 +21,10 @@ This release packages the maintained GUI fork at
 - Atomic download and history checkpoint writes.
 - Resumable history jobs with cancellation and per-channel high-water marks.
 - Discord API v10 endpoint compatibility and DiscordGo v0.29.
-- GitHub Actions CI and tag-based release builds.
+- GitHub Actions CI and tag-based single-executable Windows release builds.
+
+The release distribution intentionally contains one Windows amd64 executable
+to keep the desktop download simple.
 
 ## Upgrade notes
 

@@ -68,10 +68,10 @@ the required permissions.
 
 ### 2. Download a release
 
-Download the asset for your platform from the
+Download the single Windows amd64 executable from the
 [latest GitHub release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest).
-Extract the executable to a dedicated application directory. Do not run the
-program from a directory containing unrelated personal files.
+Extract it to a dedicated application directory. Do not run the program from a
+directory containing unrelated personal files.
 
 The local `release/` directory used by maintainers is ignored by Git and is
 not part of the source repository.
@@ -137,8 +137,8 @@ go build ./...
 ```
 
 The GitHub Actions workflows run formatting, tests, vet, and builds for pushes
-and pull requests. A tag matching `v*` builds Windows amd64, Linux amd64, and
-Linux arm64 release assets automatically.
+and pull requests. A tag matching `v*` publishes one Windows amd64 executable,
+keeping the release download simple for the desktop GUI audience.
 
 The project follows [Semantic Versioning](https://semver.org/) and
 [Conventional Commits](https://www.conventionalcommits.org/).

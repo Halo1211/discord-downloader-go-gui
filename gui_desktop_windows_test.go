@@ -46,27 +46,27 @@ func TestDesktopTrayStatusLabel(t *testing.T) {
 		{
 			name:     "waiting",
 			snapshot: desktopTraySnapshot{Runtime: "waiting"},
-		want:     "Status: waiting for Start",
+			want:     "Status: waiting for Start",
 		},
 		{
 			name:     "starting",
 			snapshot: desktopTraySnapshot{Runtime: "starting"},
-		want:     "Status: starting",
+			want:     "Status: starting",
 		},
 		{
 			name:     "running idle",
 			snapshot: desktopTraySnapshot{Runtime: "running"},
-		want:     "Status: running - no transfers",
+			want:     "Status: running - no transfers",
 		},
 		{
 			name:     "running transfers",
 			snapshot: desktopTraySnapshot{Runtime: "running", Active: 2, Queued: 3},
-		want:     "Status: running - 2 active, 3 queued",
+			want:     "Status: running - 2 active, 3 queued",
 		},
 		{
 			name:     "stopping",
 			snapshot: desktopTraySnapshot{Runtime: "stopping"},
-		want:     "Status: stopping",
+			want:     "Status: stopping",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
