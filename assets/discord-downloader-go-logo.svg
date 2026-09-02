@@ -3,22 +3,22 @@
   <desc id="desc">A rounded indigo chat and gamepad mark with a downward download arrow.</desc>
   <defs>
     <linearGradient id="surface" x1="86" y1="48" x2="426" y2="470" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#5865F2"/>
-      <stop offset="0.55" stop-color="#635BEE"/>
-      <stop offset="1" stop-color="#3B2F9B"/>
+      <stop stop-color="var(--logo-primary, #5865F2)"/>
+      <stop offset="0.55" stop-color="var(--logo-secondary, #635BEE)"/>
+      <stop offset="1" stop-color="var(--logo-deep, #3B2F9B)"/>
     </linearGradient>
     <linearGradient id="arrow" x1="256" y1="166" x2="256" y2="374" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#B9F4FF"/>
-      <stop offset="1" stop-color="#59D8F2"/>
+      <stop stop-color="var(--logo-arrow-a, #B9F4FF)"/>
+      <stop offset="1" stop-color="var(--logo-arrow-b, #59D8F2)"/>
     </linearGradient>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
       <feDropShadow dx="0" dy="18" stdDeviation="16" flood-color="#171335" flood-opacity="0.28"/>
     </filter>
   </defs>
-  <rect x="44" y="44" width="424" height="424" rx="132" fill="#14152A"/>
+  <rect x="44" y="44" width="424" height="424" rx="132" fill="var(--logo-background, #14152A)"/>
   <path d="M142 126c-42 15-72 55-72 102v67c0 57 46 103 103 103h14l-18 49 69-49h36l69 49-18-49h14c57 0 103-46 103-103v-67c0-47-30-87-72-102-39-14-81-21-114-21s-75 7-114 21Z" fill="url(#surface)" filter="url(#shadow)"/>
-  <path d="M171 195c-17 0-31 14-31 31s14 31 31 31 31-14 31-31-14-31-31-31Zm170 0c-17 0-31 14-31 31s14 31 31 31 31-14 31-31-14-31-31-31Z" fill="#F4F6FF" opacity="0.94"/>
+  <path d="M171 195c-17 0-31 14-31 31s14 31 31 31 31-14 31-31-14-31-31-31Zm170 0c-17 0-31 14-31 31s14 31 31 31 31-14 31-31-14-31-31-31Z" fill="var(--logo-detail, #F4F6FF)" opacity="0.94"/>
   <path d="M256 151v136m0 0-52-52m52 52 52-52" fill="none" stroke="url(#arrow)" stroke-linecap="round" stroke-linejoin="round" stroke-width="25"/>
-  <path d="M190 334c19 14 41 21 66 21s47-7 66-21" fill="none" stroke="#C7C9FF" stroke-linecap="round" stroke-width="14" opacity="0.8"/>
-  <circle cx="112" cy="113" r="10" fill="#6FE6F4" opacity="0.9"/>
+  <path d="M190 334c19 14 41 21 66 21s47-7 66-21" fill="none" stroke="var(--logo-detail-muted, #C7C9FF)" stroke-linecap="round" stroke-width="14" opacity="0.8"/>
+  <circle cx="112" cy="113" r="10" fill="var(--logo-accent, #6FE6F4)" opacity="0.9"/>
 </svg>

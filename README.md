@@ -35,6 +35,8 @@ The canonical project repository, releases, and issue tracker are:
 ## Features
 
 - Windows desktop dashboard with WebView2 and system-tray support.
+- Embedded Archive Relay branding with a self-contained application logo.
+- Logo colors adapt automatically to the selected dashboard theme.
 - CLI mode for servers and headless environments.
 - Real-time downloads with a bounded worker queue and retry backoff.
 - Resumable history scans with cancellation and per-channel checkpoints.
@@ -108,6 +110,7 @@ options include `--gui-address=127.0.0.1:8899`, `--no-gui-open`, `--no-tray`,
 - [Settings Guide](docs/SETTINGS.md) — configuration structure, source rules, and tuning.
 - [Commands Guide](docs/COMMANDS.md) — bot commands and history controls.
 - [History Guide](docs/HISTORY.md) — archive scans, checkpoints, cancellation, and recovery.
+- [Wiki hub](wiki/Home.md) — the complete guide set, including examples and troubleshooting.
 - [Architecture Map](ARCHITECTURE.md) — runtime flow, state boundaries, and persistence.
 - [Release Notes](RELEASE_NOTES.md) — changes included in the current release.
 

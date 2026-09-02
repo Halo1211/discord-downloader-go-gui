@@ -1,4 +1,4 @@
-# Release Notes — v2.6.3
+# Release Notes — v1.0.0
 
 This release packages the maintained GUI fork at
 `Halo1211/discord-downloader-go-gui`.
@@ -7,6 +7,8 @@ This release packages the maintained GUI fork at
 
 - Refreshed the README with a dashboard preview, release badges, and a new repository logo.
 - Added a clean vector logo asset that can be reused in project documentation and packaging.
+- Embedded the repository logo directly into the desktop dashboard so the program is self-contained.
+- The embedded logo adapts its colors to the selected dashboard theme.
 
 ## Highlights
 
@@ -24,7 +26,8 @@ This release packages the maintained GUI fork at
 - GitHub Actions CI and tag-based single-executable Windows release builds.
 
 The release distribution intentionally contains one Windows amd64 executable
-to keep the desktop download simple.
+to keep the desktop download simple. This release starts the maintained GUI
+fork's version line at `v1.0.0`.
 
 ## Upgrade notes
 

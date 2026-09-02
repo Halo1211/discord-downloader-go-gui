@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,9 @@ import (
 )
 
 const guiRequestBodyLimit int64 = 16 * 1024
+
+//go:embed assets/discord-downloader-go-logo.svg
+var guiLogoSVG string
 
 var (
 	guiFlagEnabled     bool
@@ -316,6 +320,7 @@ func guiPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	page := strings.ReplaceAll(guiHTML, "{{GUI_TOKEN}}", template.HTMLEscapeString(guiToken))
+	page = strings.ReplaceAll(page, "{{GUI_LOGO}}", guiLogoSVG)
 	_, _ = io.WriteString(w, page)
 }
 
@@ -609,8 +614,8 @@ const guiHTML = `<!doctype html>
     .app-shell { position:relative; width:min(1500px,calc(100% - 36px)); margin:0 auto; padding:18px 0 44px; }
     .topbar { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:22px; margin:0 0 14px; padding:0 4px; }
     .brand-lockup { display:flex; align-items:center; gap:13px; min-width:0; }
-    .brand-mark { position:relative; width:42px; height:42px; flex:0 0 auto; display:grid; place-items:center; border:1px solid #47604e; border-radius:50%; color:var(--lime); background:#0e1711; font:800 12px/1 ui-monospace,Consolas,monospace; box-shadow:0 0 0 5px #0d160f,0 0 32px #71d25c22; }
-    .brand-mark:after { content:""; position:absolute; width:14px; height:2px; right:-8px; top:8px; background:var(--coral); transform:rotate(-35deg); }
+    .brand-mark { position:relative; width:48px; height:48px; flex:0 0 auto; display:grid; place-items:center; padding:4px; border:1px solid #47604e; border-radius:15px; background:#0e1711; box-shadow:0 0 0 5px #0d160f,0 0 32px #71d25c22; }
+    .brand-mark svg { display:block; width:100%; height:100%; }
     .brand-name { font-size:17px; font-weight:760; letter-spacing:.02em; white-space:nowrap; }
     .brand-name em { color:var(--lime); font-style:normal; }
     .brand-caption,.microcopy { color:var(--muted); font:10px/1.4 ui-monospace,Consolas,monospace; letter-spacing:.14em; text-transform:uppercase; }
@@ -802,6 +807,12 @@ const guiHTML = `<!doctype html>
     :root[data-theme="amber"] { --lime:#ffc65c; --mint:#ff9f5a; --amber:#ffe18c; --coral:#ff755e; --line:#473821; --line2:#69502b; --ambient:#563813; --page-a:#0c0904; --page-b:#151005; --page-c:#090703; --panel-a:#1b1408; --panel-b:#100c05; }
     :root[data-theme="crimson"] { --lime:#ff7770; --mint:#ff9b7f; --amber:#ffc07c; --coral:#ff5c73; --line:#4a292b; --line2:#6c3b3e; --ambient:#5b1d28; --page-a:#0c0506; --page-b:#16090b; --page-c:#090405; --panel-a:#1c0e11; --panel-b:#100709; }
     :root[data-theme="mono"] { --lime:#f2f2ed; --mint:#b7c0ba; --amber:#d7d7d0; --coral:#eeeeea; --line:#343836; --line2:#505552; --ambient:#343837; --page-a:#080909; --page-b:#0e1010; --page-c:#060707; --panel-a:#151817; --panel-b:#0b0d0c; }
+    :root { --logo-primary:#b7f36b; --logo-secondary:#49d7a4; --logo-deep:#27432a; --logo-arrow-a:#efffc7; --logo-arrow-b:#49d7a4; --logo-detail:#f4f2e9; --logo-detail-muted:#c7e49f; --logo-accent:#b7f36b; --logo-background:#101b12; }
+    :root[data-theme="ocean"] { --logo-primary:#67abff; --logo-secondary:#50d4e8; --logo-deep:#1d3d73; --logo-arrow-a:#eef7ff; --logo-arrow-b:#50d4e8; --logo-detail:#eef6ff; --logo-detail-muted:#a9cde8; --logo-accent:#67abff; --logo-background:#0b1422; }
+    :root[data-theme="violet"] { --logo-primary:#b694ff; --logo-secondary:#e079dd; --logo-deep:#5b2b76; --logo-arrow-a:#f5eaff; --logo-arrow-b:#e079dd; --logo-detail:#f8f1ff; --logo-detail-muted:#d8b9ef; --logo-accent:#b694ff; --logo-background:#1a1024; }
+    :root[data-theme="amber"] { --logo-primary:#ffc65c; --logo-secondary:#ff9f5a; --logo-deep:#74401d; --logo-arrow-a:#fff3bd; --logo-arrow-b:#ff9f5a; --logo-detail:#fff8e8; --logo-detail-muted:#f0c27f; --logo-accent:#ffc65c; --logo-background:#211508; }
+    :root[data-theme="crimson"] { --logo-primary:#ff7770; --logo-secondary:#ff9b7f; --logo-deep:#75243a; --logo-arrow-a:#ffe3dc; --logo-arrow-b:#ff9b7f; --logo-detail:#fff1ef; --logo-detail-muted:#f0a9a2; --logo-accent:#ff7770; --logo-background:#251015; }
+    :root[data-theme="mono"] { --logo-primary:#f2f2ed; --logo-secondary:#b7c0ba; --logo-deep:#59615c; --logo-arrow-a:#ffffff; --logo-arrow-b:#b7c0ba; --logo-detail:#ffffff; --logo-detail-muted:#c8cec9; --logo-accent:#f2f2ed; --logo-background:#171a18; }
     body { background:radial-gradient(circle at 74% -20%,var(--ambient) 0,transparent 38%),linear-gradient(145deg,var(--page-a) 0,var(--page-b) 52%,var(--page-c) 100%); }
     .panel,.telemetry,.side-card { background:linear-gradient(145deg,var(--panel-a),var(--panel-b)); }
     .control-picker { padding:3px 5px 3px 10px; }
@@ -834,7 +845,7 @@ const guiHTML = `<!doctype html>
   <main class="app-shell">
     <header class="topbar">
       <div class="brand-lockup">
-        <div class="brand-mark" aria-hidden="true">AR</div>
+        <div class="brand-mark" aria-hidden="true">{{GUI_LOGO}}</div>
         <div><div class="brand-name">Archive <em>Relay</em></div><div class="brand-caption">Discord media operations</div></div>
       </div>
       <div class="topbar-actions">
