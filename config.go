@@ -3,11 +3,15 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/fatih/color"
@@ -22,6 +26,7 @@ var (
 	configFileC    bool
 	configFileYaml bool
 	config         configuration = defaultConfiguration()
+	configFileMu   sync.Mutex
 )
 
 //#region Config, Credentials
@@ -70,18 +75,23 @@ var (
 	defConfig_ScanOwnMessages      bool   = false
 	defConfig_GithubUpdateChecking bool   = true
 	// Appearance
-	defConfig_PresenceEnabled      bool               = true
-	defConfig_PresenceStatus       string             = string(discordgo.StatusIdle)
-	defConfig_PresenceType         discordgo.GameType = discordgo.GameTypeGame
-	defConfig_ReactWhenDownloaded  bool               = false
-	defConfig_InflateDownloadCount int64              = 0
+	defConfig_PresenceEnabled      bool                   = true
+	defConfig_PresenceStatus       string                 = string(discordgo.StatusIdle)
+	defConfig_PresenceType         discordgo.ActivityType = discordgo.ActivityTypeGame
+	defConfig_ReactWhenDownloaded  bool                   = false
+	defConfig_InflateDownloadCount int64                  = 0
 
 	// These are only defaults to "fix" when loading settings for when people put stupid values
 	defConfig_ProcessLimit int = 32
 
-	defConfig_DiscordTimeout   int = 180
-	defConfig_DownloadTimeout  int = 60
-	defConfig_DownloadRetryMax int = 2
+	defConfig_DiscordTimeout         int   = 180
+	defConfig_DownloadTimeout        int   = 60
+	defConfig_DownloadRetryMax       int   = 2
+	defConfig_DownloadWorkers        int   = 4
+	defConfig_DownloadQueueSize      int   = 256
+	defConfig_DownloadMaxFileSize    int64 = 512 * 1024 * 1024
+	defConfig_DownloadMaxRedirects   int   = 5
+	defConfig_HistoryDownloadWorkers int   = 4
 
 	defConfig_HistoryManagerRate  int = 5
 	defConfig_CheckupRate         int = 30
@@ -92,6 +102,14 @@ var (
 	defConfig_FilenameFormat     string = "{{date}} {{file}}"
 
 	defConfig_HistoryMaxJobs int = 3
+)
+
+const (
+	maxConfigDownloadRetry         = 100
+	maxConfigDownloadWorkers       = 128
+	maxConfigDownloadQueueSize     = 1_000_000
+	maxConfigHistoryJobs           = 64
+	maxConfigHistoryDownloadWorker = 128
 )
 
 func defaultConfiguration() configuration {
@@ -116,6 +134,12 @@ func defaultConfiguration() configuration {
 		Debug:                 defConfig_Debug,
 		BackupDatabaseOnStart: false,
 		WatchSettings:         true,
+		GUIEnabled:            true,
+		GUIAddress:            "127.0.0.1:7744",
+		GUIOpenBrowser:        true,
+		GUIAutoStart:          false,
+		GUICloseToTray:        true,
+		GUIStartMinimized:     false,
 		LogSettings:           true,
 		MessageOutput:         true,
 		MessageOutputHistory:  false,
@@ -124,6 +148,10 @@ func defaultConfiguration() configuration {
 		DiscordTimeout:       defConfig_DiscordTimeout,
 		DownloadTimeout:      defConfig_DownloadTimeout,
 		DownloadRetryMax:     defConfig_DownloadRetryMax,
+		DownloadWorkers:      defConfig_DownloadWorkers,
+		DownloadQueueSize:    defConfig_DownloadQueueSize,
+		DownloadMaxFileSize:  defConfig_DownloadMaxFileSize,
+		DownloadMaxRedirects: defConfig_DownloadMaxRedirects,
 		ExitOnBadConnection:  false,
 		GithubUpdateChecking: defConfig_GithubUpdateChecking,
 
@@ -166,17 +194,18 @@ func defaultConfiguration() configuration {
 		HistoryTyping:              true,
 
 		// History
-		HistoryMaxJobs:        defConfig_HistoryMaxJobs,
-		AutoHistory:           false,
-		AutoHistoryExit:       false,
-		AutoHistoryBefore:     "",
-		AutoHistorySince:      "",
-		SendHistoryStatus:     true,
-		SendAutoHistoryStatus: false,
-		OutputHistoryStatus:   true,
-		OutputHistoryErrors:   true,
-		HistoryRequestCount:   100,
-		HistoryRequestDelay:   0,
+		HistoryMaxJobs:         defConfig_HistoryMaxJobs,
+		HistoryDownloadWorkers: defConfig_HistoryDownloadWorkers,
+		AutoHistory:            false,
+		AutoHistoryExit:        false,
+		AutoHistoryBefore:      "",
+		AutoHistorySince:       "",
+		SendHistoryStatus:      true,
+		SendAutoHistoryStatus:  false,
+		OutputHistoryStatus:    true,
+		OutputHistoryErrors:    true,
+		HistoryRequestCount:    100,
+		HistoryRequestDelay:    0,
 
 		// Rules for Saving
 		Subfolders:             []string{"{{fileType}}"},
@@ -248,6 +277,12 @@ type configuration struct {
 	GithubUpdateChecking  bool   `json:"githubUpdateChecking" yaml:"githubUpdateChecking"`
 	ExitOnBadConnection   bool   `json:"exitOnBadConnection" yaml:"exitOnBadConnection"`
 	WatchSettings         bool   `json:"watchSettings" yaml:"watchSettings"`
+	GUIEnabled            bool   `json:"guiEnabled,omitempty" yaml:"guiEnabled,omitempty"`
+	GUIAddress            string `json:"guiAddress,omitempty" yaml:"guiAddress,omitempty"`
+	GUIOpenBrowser        bool   `json:"guiOpenBrowser,omitempty" yaml:"guiOpenBrowser,omitempty"`
+	GUIAutoStart          bool   `json:"guiAutoStart,omitempty" yaml:"guiAutoStart,omitempty"`
+	GUICloseToTray        bool   `json:"guiCloseToTray" yaml:"guiCloseToTray"`
+	GUIStartMinimized     bool   `json:"guiStartMinimized,omitempty" yaml:"guiStartMinimized,omitempty"`
 	BackupDatabaseOnStart bool   `json:"backupDatabaseOnStart" yaml:"backupDatabaseOnStart"`
 	CheckupRate           int    `json:"checkupRate,omitempty" yaml:"checkupRate,omitempty"`
 	ConnectionCheck       bool   `json:"connectionCheck,omitempty" yaml:"connectionCheck,omitempty"`
@@ -267,6 +302,10 @@ type configuration struct {
 	DiscordTimeout       int    `json:"discordTimeout" yaml:"discordTimeout"`
 	DownloadTimeout      int    `json:"downloadTimeout" yaml:"downloadTimeout"`
 	DownloadRetryMax     int    `json:"downloadRetryMax" yaml:"downloadRetryMax"`
+	DownloadWorkers      int    `json:"downloadWorkers" yaml:"downloadWorkers"`
+	DownloadQueueSize    int    `json:"downloadQueueSize" yaml:"downloadQueueSize"`
+	DownloadMaxFileSize  int64  `json:"downloadMaxFileSize" yaml:"downloadMaxFileSize"`
+	DownloadMaxRedirects int    `json:"downloadMaxRedirects" yaml:"downloadMaxRedirects"`
 	SendErrorMessages    bool   `json:"sendErrorMessages" yaml:"sendErrorMessages"`
 	IgnoreEmojis         bool   `json:"ignoreEmojis" yaml:"ignoreEmojis"`
 	IgnoreStickers       bool   `json:"ignoreStickers" yaml:"ignoreStickers"`
@@ -287,13 +326,13 @@ type configuration struct {
 	SendFileCaption    string   `json:"sendFileCaption,omitempty" yaml:"sendFileCaption,omitempty"`
 
 	// Discord Presence
-	PresenceEnabled     bool               `json:"presenceEnabled" yaml:"presenceEnabled"`
-	PresenceStatus      string             `json:"presenceStatus" yaml:"presenceStatus"`
-	PresenceType        discordgo.GameType `json:"presenceType" yaml:"presenceType"`
-	PresenceLabel       *string            `json:"presenceLabel" yaml:"presenceLabel"`
-	PresenceDetails     *string            `json:"presenceDetails" yaml:"presenceDetails"`
-	PresenceState       *string            `json:"presenceState" yaml:"presenceState"`
-	PresenceRefreshRate int                `json:"presenceRefreshRate,omitempty" yaml:"presenceRefreshRate,omitempty"`
+	PresenceEnabled     bool                   `json:"presenceEnabled" yaml:"presenceEnabled"`
+	PresenceStatus      string                 `json:"presenceStatus" yaml:"presenceStatus"`
+	PresenceType        discordgo.ActivityType `json:"presenceType" yaml:"presenceType"`
+	PresenceLabel       *string                `json:"presenceLabel" yaml:"presenceLabel"`
+	PresenceDetails     *string                `json:"presenceDetails" yaml:"presenceDetails"`
+	PresenceState       *string                `json:"presenceState" yaml:"presenceState"`
+	PresenceRefreshRate int                    `json:"presenceRefreshRate,omitempty" yaml:"presenceRefreshRate,omitempty"`
 
 	// Discord Appearance
 	ReactWhenDownloaded        bool    `json:"reactWhenDownloaded" yaml:"reactWhenDownloaded"`
@@ -304,17 +343,18 @@ type configuration struct {
 	EmbedColor                 *string `json:"embedColor,omitempty" yaml:"embedColor,omitempty"`
 
 	// History
-	HistoryMaxJobs        int    `json:"historyMaxJobs" yaml:"historyMaxJobs"`
-	AutoHistory           bool   `json:"autoHistory" yaml:"autoHistory"`
-	AutoHistoryExit       bool   `json:"autoHistoryExit" yaml:"autoHistoryExit"`
-	AutoHistoryBefore     string `json:"autoHistoryBefore" yaml:"autoHistoryBefore"`
-	AutoHistorySince      string `json:"autoHistorySince" yaml:"autoHistorySince"`
-	SendAutoHistoryStatus bool   `json:"sendAutoHistoryStatus" yaml:"sendAutoHistoryStatus"`
-	SendHistoryStatus     bool   `json:"sendHistoryStatus" yaml:"sendHistoryStatus"`
-	OutputHistoryStatus   bool   `json:"outputHistoryStatus" yaml:"outputHistoryStatus"`
-	OutputHistoryErrors   bool   `json:"outputHistoryErrors" yaml:"outputHistoryErrors"`
-	HistoryRequestCount   int    `json:"historyRequestCount" yaml:"historyRequestCount"`
-	HistoryRequestDelay   int    `json:"historyRequestDelay" yaml:"historyRequestDelay"`
+	HistoryMaxJobs         int    `json:"historyMaxJobs" yaml:"historyMaxJobs"`
+	HistoryDownloadWorkers int    `json:"historyDownloadWorkers" yaml:"historyDownloadWorkers"`
+	AutoHistory            bool   `json:"autoHistory" yaml:"autoHistory"`
+	AutoHistoryExit        bool   `json:"autoHistoryExit" yaml:"autoHistoryExit"`
+	AutoHistoryBefore      string `json:"autoHistoryBefore" yaml:"autoHistoryBefore"`
+	AutoHistorySince       string `json:"autoHistorySince" yaml:"autoHistorySince"`
+	SendAutoHistoryStatus  bool   `json:"sendAutoHistoryStatus" yaml:"sendAutoHistoryStatus"`
+	SendHistoryStatus      bool   `json:"sendHistoryStatus" yaml:"sendHistoryStatus"`
+	OutputHistoryStatus    bool   `json:"outputHistoryStatus" yaml:"outputHistoryStatus"`
+	OutputHistoryErrors    bool   `json:"outputHistoryErrors" yaml:"outputHistoryErrors"`
+	HistoryRequestCount    int    `json:"historyRequestCount" yaml:"historyRequestCount"`
+	HistoryRequestDelay    int    `json:"historyRequestDelay" yaml:"historyRequestDelay"`
 
 	// Rules for Saving
 	Save                   bool                        `json:"save" yaml:"save"`
@@ -518,10 +558,224 @@ type configurationAdminChannel struct {
 
 //#region Management
 
+func decodeConfigurationContent(content string, yamlConfig, jsoncConfig bool) (configuration, error) {
+	decoded := defaultConfiguration()
+	var err error
+	switch {
+	case yamlConfig:
+		err = yaml.Unmarshal([]byte(content), &decoded)
+	case jsoncConfig:
+		err = jsonc.Unmarshal([]byte(content), &decoded)
+	default:
+		err = json.Unmarshal([]byte(content), &decoded)
+	}
+	return decoded, err
+}
+
+func importLegacyINIKey(cfg *ini.File, section, key string, target interface{}) bool {
+	if cfg == nil || !cfg.Section(section).HasKey(key) {
+		return false
+	}
+	value := cfg.Section(section).Key(key)
+	switch output := target.(type) {
+	case *string:
+		*output = value.String()
+	case *int:
+		*output = value.MustInt()
+	case *bool:
+		*output = value.MustBool()
+	default:
+		return false
+	}
+	return true
+}
+
+func legacyEscapeConfigurationBackslashes(content string) string {
+	var fixed strings.Builder
+	fixed.Grow(len(content))
+	isHex := func(value byte) bool {
+		return value >= '0' && value <= '9' || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F'
+	}
+	isValidEscapeAt := func(value string, index int) bool {
+		if index+1 >= len(value) || value[index] != '\\' {
+			return false
+		}
+		next := value[index+1]
+		if strings.ContainsRune(`"\\/bfnrt`, rune(next)) {
+			return true
+		}
+		return next == 'u' && index+5 < len(value) &&
+			isHex(value[index+2]) && isHex(value[index+3]) && isHex(value[index+4]) && isHex(value[index+5])
+	}
+	for i := 0; i < len(content); i++ {
+		if content[i] != '"' {
+			fixed.WriteByte(content[i])
+			continue
+		}
+
+		end := i + 1
+		for end < len(content) {
+			if content[end] == '\\' && end+1 < len(content) {
+				end += 2
+				continue
+			}
+			if content[end] == '"' {
+				break
+			}
+			end++
+		}
+		if end >= len(content) {
+			fixed.WriteString(content[i:])
+			break
+		}
+
+		rawString := content[i+1 : end]
+		hasInvalidEscape := false
+		for index := 0; index < len(rawString); index++ {
+			if rawString[index] != '\\' {
+				continue
+			}
+			if !isValidEscapeAt(rawString, index) {
+				hasInvalidEscape = true
+				break
+			}
+			index++
+			if rawString[index] == 'u' {
+				index += 4
+			}
+		}
+
+		fixed.WriteByte('"')
+		if !hasInvalidEscape {
+			fixed.WriteString(rawString)
+		} else {
+			for index := 0; index < len(rawString); index++ {
+				if rawString[index] != '\\' {
+					fixed.WriteByte(rawString[index])
+					continue
+				}
+				// Preserve explicitly escaped separators/quotes. All other single
+				// slashes in a string containing an invalid escape are legacy path
+				// separators, even when their next byte happens to be b, f, n, r,
+				// or t (for example the \b in C:\logs\bot.log).
+				if index+1 < len(rawString) && strings.ContainsRune(`"\\/`, rune(rawString[index+1])) {
+					fixed.WriteByte('\\')
+					fixed.WriteByte(rawString[index+1])
+					index++
+					continue
+				}
+				fixed.WriteString(`\\`)
+			}
+		}
+		fixed.WriteByte('"')
+		i = end
+	}
+	return fixed.String()
+}
+
+func decodeConfigurationWithLegacyFallback(content string, yamlConfig, jsoncConfig bool) (configuration, string, error) {
+	decoded, err := decodeConfigurationContent(content, yamlConfig, jsoncConfig)
+	if err == nil || yamlConfig {
+		return decoded, content, err
+	}
+
+	// Older configurations commonly contain unescaped Windows paths. Preserve
+	// support for those files, but only after standards-compliant JSON parsing
+	// fails so valid escapes such as \n and \t keep their intended meaning.
+	legacyContent := legacyEscapeConfigurationBackslashes(content)
+	legacyDecoded, legacyErr := decodeConfigurationContent(legacyContent, false, jsoncConfig)
+	if legacyErr == nil {
+		return legacyDecoded, legacyContent, nil
+	}
+	return decoded, content, err
+}
+
+func normalizeLoadedConfiguration(candidate *configuration) {
+	defaults := defaultConfiguration()
+	if candidate.Credentials.TwitterAuthEnabled == nil {
+		candidate.Credentials.TwitterAuthEnabled = defaults.Credentials.TwitterAuthEnabled
+	}
+	if candidate.Credentials.InstagramAuthEnabled == nil {
+		candidate.Credentials.InstagramAuthEnabled = defaults.Credentials.InstagramAuthEnabled
+	}
+	if candidate.InflateDownloadCount == nil {
+		candidate.InflateDownloadCount = defaults.InflateDownloadCount
+	}
+	if candidate.Filters == nil {
+		candidate.Filters = defaults.Filters
+	}
+}
+
+func redactConfigurationForOutput(candidate *configuration) {
+	guiRedactConfigurationSecrets(candidate)
+	if candidate.Credentials.TwitterUsername != "" {
+		candidate.Credentials.TwitterUsername = "STRIPPED_FOR_OUTPUT"
+	}
+	if candidate.Credentials.InstagramUsername != "" {
+		candidate.Credentials.InstagramUsername = "STRIPPED_FOR_OUTPUT"
+	}
+}
+
+func applyConfigurationPaths(candidate configuration) {
+	pathCache = "cache"
+	if candidate.OverwriteCachePath != "" {
+		pathCache = candidate.OverwriteCachePath
+	}
+	pathCacheSettingsJSON = filepath.Join(pathCache, "settings.json")
+	pathCacheSettingsYAML = filepath.Join(pathCache, "settings.yaml")
+	pathCacheHistory = filepath.Join(pathCache, "history")
+	pathCacheDuplo = filepath.Join(pathCache, ".duplo")
+	pathCacheTwitter = filepath.Join(pathCache, "twitter.json")
+	pathCacheInstagram = filepath.Join(pathCache, "instagram.json")
+	pathConstants = filepath.Join(pathCache, "constants.json")
+	pathDatabaseBase = "database"
+	pathDatabaseBackups = "backups"
+
+	if candidate.OverwriteHistoryPath != "" {
+		pathCacheHistory = candidate.OverwriteHistoryPath
+	}
+	if candidate.OverwriteDuploPath != "" {
+		pathCacheDuplo = candidate.OverwriteDuploPath
+	}
+	if candidate.OverwriteTwitterPath != "" {
+		pathCacheTwitter = candidate.OverwriteTwitterPath
+	}
+	if candidate.OverwriteInstagramPath != "" {
+		pathCacheInstagram = candidate.OverwriteInstagramPath
+	}
+	if candidate.OverwriteConstantsPath != "" {
+		pathConstants = candidate.OverwriteConstantsPath
+	}
+	if candidate.OverwriteDatabasePath != "" {
+		pathDatabaseBase = candidate.OverwriteDatabasePath
+	}
+	if candidate.OverwriteDatabaseBackupsPath != "" {
+		pathDatabaseBackups = candidate.OverwriteDatabaseBackupsPath
+	}
+}
+
+func applyConfigurationReaction(candidate configuration) {
+	defaultReact = builtInDefaultReact
+	if candidate.OverwriteDefaultReaction != nil {
+		defaultReact = *candidate.OverwriteDefaultReaction
+	}
+}
+
 func loadConfig() error {
+	configFileMu.Lock()
+	defer configFileMu.Unlock()
+	return loadConfigUnlocked()
+}
+
+func loadConfigUnlocked() error {
 	// Determine config type
+	configFileYaml = false
+	configFileC = false
 	if _, err := os.Stat(configFileBase + ".yaml"); err == nil {
 		configFile = configFileBase + ".yaml"
+		configFileYaml = true
+	} else if _, err := os.Stat(configFileBase + ".yml"); err == nil {
+		configFile = configFileBase + ".yml"
 		configFileYaml = true
 	} else if _, err := os.Stat(configFileBase + ".jsonc"); err == nil {
 		configFile = configFileBase + ".jsonc"
@@ -538,29 +792,16 @@ func loadConfig() error {
 	if err != nil {
 		log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to open file...\t%s", err))
 		createConfig()
-		properExit()
+		return fmt.Errorf("settings file %q was created; add your Discord token, then restart the application", configFile)
 	} else {
-		fixed := string(configContent)
-		// Fix backslashes
-		fixed = strings.ReplaceAll(fixed, "\\", "\\\\")
-		for strings.Contains(fixed, "\\\\\\") {
-			fixed = strings.ReplaceAll(fixed, "\\\\\\", "\\\\")
-		}
 		//TODO: Not even sure if this is realistic to do but would be nice to have line comma & trailing comma fixing
 
 		// Parse
-		newConfig := defaultConfiguration()
-		if configFileYaml {
-			err = yaml.Unmarshal([]byte(fixed), &newConfig)
-		} else if configFileC {
-			err = jsonc.Unmarshal([]byte(fixed), &newConfig)
-		} else {
-			err = json.Unmarshal([]byte(fixed), &newConfig)
-		}
+		newConfig, fixed, err := decodeConfigurationWithLegacyFallback(string(configContent), configFileYaml, configFileC)
 		if err != nil {
 			log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to parse settings file...\t%s", err))
 			log.Println(lg("Settings", "loadConfig", color.MagentaString, "Please ensure you're following proper JSON format syntax."))
-			properExit()
+			return fmt.Errorf("could not parse settings file %q: %w", configFile, err)
 		}
 		// Constants
 		if newConfig.Constants != nil {
@@ -570,22 +811,16 @@ func loadConfig() error {
 				}
 			}
 			// Re-parse
-			newConfig = defaultConfiguration()
-			if configFileYaml {
-				err = yaml.Unmarshal([]byte(fixed), &newConfig)
-			} else if configFileC {
-				err = jsonc.Unmarshal([]byte(fixed), &newConfig)
-			} else {
-				err = json.Unmarshal([]byte(fixed), &newConfig)
-			}
+			newConfig, err = decodeConfigurationContent(fixed, configFileYaml, configFileC)
 			if err != nil {
 				log.Println(lg("Settings", "loadConfig", color.HiRedString,
 					"Failed to re-parse settings file after replacing constants...\t%s", err))
 				log.Println(lg("Settings", "loadConfig", color.MagentaString, "Please ensure you're following proper JSON format syntax."))
-				properExit()
+				return fmt.Errorf("could not parse settings file %q after replacing constants: %w", configFile, err)
 			}
 			newConfig.Constants = nil
 		}
+		normalizeLoadedConfiguration(&newConfig)
 		config = newConfig
 
 		// Source Defaults
@@ -610,7 +845,7 @@ func loadConfig() error {
 		}
 
 		// Checks & Fixes
-		if config.ProcessLimit < 1 {
+		if config.ProcessLimit < 1 || config.ProcessLimit > 1024 {
 			config.ProcessLimit = defConfig_ProcessLimit
 		}
 		if config.DiscordTimeout < 10 {
@@ -619,8 +854,23 @@ func loadConfig() error {
 		if config.DownloadTimeout < 10 {
 			config.DownloadTimeout = defConfig_DownloadTimeout
 		}
-		if config.DownloadRetryMax < 1 {
+		if config.DownloadRetryMax < 1 || config.DownloadRetryMax > maxConfigDownloadRetry {
 			config.DownloadRetryMax = defConfig_DownloadRetryMax
+		}
+		if config.DownloadWorkers < 1 || config.DownloadWorkers > maxConfigDownloadWorkers {
+			config.DownloadWorkers = defConfig_DownloadWorkers
+		}
+		if config.DownloadQueueSize < config.DownloadWorkers || config.DownloadQueueSize > maxConfigDownloadQueueSize {
+			config.DownloadQueueSize = defConfig_DownloadQueueSize
+		}
+		if config.DownloadMaxFileSize < 1 {
+			config.DownloadMaxFileSize = defConfig_DownloadMaxFileSize
+		}
+		if config.DownloadMaxRedirects < 0 {
+			config.DownloadMaxRedirects = defConfig_DownloadMaxRedirects
+		}
+		if strings.TrimSpace(config.GUIAddress) == "" {
+			config.GUIAddress = "127.0.0.1:7744"
 		}
 		if config.CheckupRate < 1 {
 			config.CheckupRate = defConfig_CheckupRate
@@ -637,13 +887,26 @@ func loadConfig() error {
 		if config.FilenameFormat == "" {
 			config.FilenameFormat = defConfig_FilenameFormat
 		}
-		if config.HistoryMaxJobs < 1 {
+		if config.HistoryMaxJobs < 1 || config.HistoryMaxJobs > maxConfigHistoryJobs {
 			config.HistoryMaxJobs = defConfig_HistoryMaxJobs
+		}
+		if config.HistoryDownloadWorkers < 1 || config.HistoryDownloadWorkers > maxConfigHistoryDownloadWorker {
+			config.HistoryDownloadWorkers = defConfig_HistoryDownloadWorkers
+		}
+		if config.HistoryManagerRate < 1 {
+			config.HistoryManagerRate = defConfig_HistoryManagerRate
+		}
+		// Discord's Get Channel Messages endpoint accepts at most 100 messages.
+		if config.HistoryRequestCount < 1 || config.HistoryRequestCount > 100 {
+			config.HistoryRequestCount = 100
+		}
+		for _, warning := range validateConfiguration() {
+			log.Println(lg("Settings", "Validation", color.HiYellowString, "WARNING: %s", warning))
 		}
 
 		// Log to File
 		if config.LogOutput != "" {
-			f, err := os.OpenFile(config.LogOutput, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			f, err := os.OpenFile(config.LogOutput, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
 			if err != nil {
 				log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to open LogOutput file...\t%s", err))
 			} else {
@@ -708,63 +971,15 @@ func loadConfig() error {
 		}
 
 		// Overwrite Paths
-		if config.OverwriteCachePath != "" {
-			pathCache = config.OverwriteCachePath
-		}
-		if config.OverwriteHistoryPath != "" {
-			pathCacheHistory = config.OverwriteHistoryPath
-		}
-		if config.OverwriteDuploPath != "" {
-			pathCacheDuplo = config.OverwriteDuploPath
-		}
-		if config.OverwriteTwitterPath != "" {
-			pathCacheTwitter = config.OverwriteTwitterPath
-		}
-		if config.OverwriteInstagramPath != "" {
-			pathCacheInstagram = config.OverwriteInstagramPath
-		}
-		if config.OverwriteConstantsPath != "" {
-			pathConstants = config.OverwriteConstantsPath
-		}
-		if config.OverwriteDatabasePath != "" {
-			pathDatabaseBase = config.OverwriteDatabasePath
-		}
-		if config.OverwriteDatabaseBackupsPath != "" {
-			pathDatabaseBackups = config.OverwriteDatabaseBackupsPath
-		}
+		applyConfigurationPaths(config)
 
 		// Overwrite Default Reaction
-		if config.OverwriteDefaultReaction != nil {
-			defaultReact = *config.OverwriteDefaultReaction
-		}
+		applyConfigurationReaction(config)
 
 		// Settings Output
 		if config.LogSettings {
 			dupeConfig := config
-			if dupeConfig.Credentials.Token != "" && dupeConfig.Credentials.Token != placeholderToken {
-				dupeConfig.Credentials.Token = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.Email != "" && dupeConfig.Credentials.Email != placeholderEmail {
-				dupeConfig.Credentials.Email = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.Password != "" && dupeConfig.Credentials.Password != placeholderPassword {
-				dupeConfig.Credentials.Password = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.TwitterUsername != "" {
-				dupeConfig.Credentials.TwitterUsername = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.TwitterPassword != "" {
-				dupeConfig.Credentials.TwitterPassword = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.InstagramUsername != "" {
-				dupeConfig.Credentials.InstagramUsername = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.InstagramPassword != "" {
-				dupeConfig.Credentials.InstagramPassword = "STRIPPED_FOR_OUTPUT"
-			}
-			if dupeConfig.Credentials.FlickrApiKey != "" {
-				dupeConfig.Credentials.FlickrApiKey = "STRIPPED_FOR_OUTPUT"
-			}
+			redactConfigurationForOutput(&dupeConfig)
 			s, err := json.MarshalIndent(dupeConfig, "", "\t")
 			if err != nil {
 				log.Println(lg("Debug", "loadConfig", color.HiRedString, "Failed to output...\t%s", err))
@@ -781,7 +996,7 @@ func loadConfig() error {
 			log.Println(lg("Settings", "loadConfig", color.HiYellowString, "Please save your credentials & info into \"%s\" then restart...", configFile))
 			log.Println(lg("Settings", "loadConfig", color.MagentaString, "If your credentials are already properly saved, please ensure you're following proper JSON format syntax..."))
 			log.Println(lg("Settings", "loadConfig", color.MagentaString, "You DO NOT NEED token *AND* email/password, just one OR the other."))
-			properExit()
+			return fmt.Errorf("no valid Discord login found in %q; add a token, then restart the application", configFile)
 		}
 
 		allString := ""
@@ -806,19 +1021,61 @@ func loadConfig() error {
 		os.MkdirAll(pathCache, 0755)
 
 		// Convert and cache
+		cacheConfig := config
+		redactConfigurationForOutput(&cacheConfig)
 		if !configFileYaml {
-			d, err := yaml.Marshal(&config)
+			d, err := yaml.Marshal(&cacheConfig)
 			if err == nil {
-				os.WriteFile(pathCacheSettingsYAML, d, 0644)
+				_ = writeFileAtomic(pathCacheSettingsYAML, d, 0600)
 			}
 		} else {
-			d, err := json.Marshal(&config)
+			d, err := json.Marshal(&cacheConfig)
 			if err == nil {
-				os.WriteFile(pathCacheSettingsJSON, d, 0644)
+				_ = writeFileAtomic(pathCacheSettingsJSON, d, 0600)
 			}
 		}
 	}
 
+	return nil
+}
+
+func validateConfiguration() []string {
+	warnings := make([]string, 0)
+	validateSource := func(label string, source configurationSource) {
+		if source.Enabled != nil && *source.Enabled && source.Save != nil && *source.Save && strings.TrimSpace(source.Destination) == "" {
+			warnings = append(warnings, fmt.Sprintf("%s is enabled for saving but has an empty destination", label))
+		}
+		if source.Filters != nil && source.Filters.AllowedDomains != nil {
+			for _, domain := range *source.Filters.AllowedDomains {
+				if strings.TrimSpace(domain) == "" {
+					warnings = append(warnings, fmt.Sprintf("%s contains an empty allowed domain", label))
+				}
+			}
+		}
+	}
+	for i, source := range config.Users {
+		validateSource(fmt.Sprintf("users[%d]", i), source)
+	}
+	for i, source := range config.Servers {
+		validateSource(fmt.Sprintf("servers[%d]", i), source)
+	}
+	for i, source := range config.Categories {
+		validateSource(fmt.Sprintf("categories[%d]", i), source)
+	}
+	for i, source := range config.Channels {
+		validateSource(fmt.Sprintf("channels[%d]", i), source)
+	}
+	if config.All != nil {
+		validateSource("all", *config.All)
+	}
+	return warnings
+}
+
+func validateRuntimeCredentials(candidate configuration) error {
+	token := strings.TrimSpace(candidate.Credentials.Token)
+	if token == "" || token == placeholderToken {
+		return errors.New("configure a Discord bot token in Settings before starting")
+	}
 	return nil
 }
 
@@ -844,40 +1101,34 @@ func createConfig() {
 				"Unable to read your old config file:\t%s", err))
 			cfg = ini.Empty()
 		} else { // Import old ini
-			importKey := func(section string, key string, outVar interface{}, outType string) bool {
-				if cfg.Section(section).HasKey(key) {
-					if outType == "string" {
-						outVar = cfg.Section(section).Key(key).String()
-					} else if outType == "int" {
-						outVar = cfg.Section(section).Key(key).MustInt()
-					} else if outType == "bool" {
-						outVar = cfg.Section(section).Key(key).MustBool()
-					}
-					log.Println(lg("Settings", "create", color.GreenString, "IMPORTED %s - %s:\t\t\t%s", section, key, outVar))
-					return true
+			importKey := func(section string, key string, outVar interface{}) bool {
+				if !importLegacyINIKey(cfg, section, key, outVar) {
+					return false
 				}
-				return false
+				log.Println(lg("Settings", "create", color.GreenString,
+					"IMPORTED %s - %s", section, key))
+				return true
 			}
 
 			// Auth
-			if !importKey("auth", "token", &defaultConfig.Credentials.Token, "string") {
+			if !importKey("auth", "token", &defaultConfig.Credentials.Token) {
 				defaultConfig.Credentials.Token = ""
 			}
-			if !importKey("auth", "email", &defaultConfig.Credentials.Email, "string") {
+			if !importKey("auth", "email", &defaultConfig.Credentials.Email) {
 				defaultConfig.Credentials.Email = ""
 			}
-			if !importKey("auth", "password", &defaultConfig.Credentials.Password, "string") {
+			if !importKey("auth", "password", &defaultConfig.Credentials.Password) {
 				defaultConfig.Credentials.Password = ""
 			}
-			importKey("flickr", "api key", &defaultConfig.Credentials.FlickrApiKey, "string")
+			importKey("flickr", "api key", &defaultConfig.Credentials.FlickrApiKey)
 			// General
-			importKey("general", "max download retries", &defaultConfig.DownloadRetryMax, "int")
-			importKey("general", "download timeout", &defaultConfig.DownloadTimeout, "int")
+			importKey("general", "max download retries", &defaultConfig.DownloadRetryMax)
+			importKey("general", "download timeout", &defaultConfig.DownloadTimeout)
 
 			// Status
-			importKey("status", "status enabled", &defaultConfig.PresenceEnabled, "bool")
-			importKey("status", "status type", &defaultConfig.PresenceStatus, "string")
-			importKey("status", "status label", &defaultConfig.PresenceType, "int")
+			importKey("status", "status enabled", &defaultConfig.PresenceEnabled)
+			importKey("status", "status type", &defaultConfig.PresenceStatus)
+			importKey("status", "status label", &defaultConfig.PresenceType)
 
 			// Channels
 			InteractiveChannelWhitelist := cfg.Section("interactive channels").KeysHash()
@@ -914,72 +1165,75 @@ func createConfig() {
 		defaultConfig.AdminChannels = append(defaultConfig.AdminChannels, baseAdminChannel)
 		adminChannelDefault(&defaultConfig.AdminChannels[0])
 
-		//TODO: Improve, this is very crude, I just wanted *something* for this.
-		log.Print(lg("Settings", "create", color.HiCyanString, "Would you like to enter settings info now? [Y/N]: "))
-		reader := bufio.NewReader(os.Stdin)
-		inputCredsYN, _ := reader.ReadString('\n')
-		inputCredsYN = strings.ReplaceAll(inputCredsYN, "\n", "")
-		inputCredsYN = strings.ReplaceAll(inputCredsYN, "\r", "")
-		if strings.Contains(strings.ToLower(inputCredsYN), "y") {
-		EnterCreds:
-			log.Print(color.HiCyanString("Token or Login? [\"token\"/\"login\"]: "))
-			inputCreds, _ := reader.ReadString('\n')
-			inputCreds = strings.ReplaceAll(inputCreds, "\n", "")
-			inputCreds = strings.ReplaceAll(inputCreds, "\r", "")
-			if strings.Contains(strings.ToLower(inputCreds), "token") {
-			EnterToken:
-				log.Print(color.HiCyanString("Enter token: "))
-				inputToken, _ := reader.ReadString('\n')
-				inputToken = strings.ReplaceAll(inputToken, "\n", "")
-				inputToken = strings.ReplaceAll(inputToken, "\r", "")
-				if inputToken != "" {
-					defaultConfig.Credentials.Token = inputToken
-				} else {
-					log.Println(lg("Settings", "create", color.HiRedString, "Please input token..."))
-					goto EnterToken
-				}
-			} else if strings.Contains(strings.ToLower(inputCreds), "login") {
-			EnterEmail:
-				log.Print(color.HiCyanString("Enter email: "))
-				inputEmail, _ := reader.ReadString('\n')
-				inputEmail = strings.ReplaceAll(inputEmail, "\n", "")
-				inputEmail = strings.ReplaceAll(inputEmail, "\r", "")
-				if strings.Contains(inputEmail, "@") {
-					defaultConfig.Credentials.Email = inputEmail
-				EnterPassword:
-					log.Print(color.HiCyanString("Enter password: "))
-					inputPassword, _ := reader.ReadString('\n')
-					inputPassword = strings.ReplaceAll(inputPassword, "\n", "")
-					inputPassword = strings.ReplaceAll(inputPassword, "\r", "")
-					if inputPassword != "" {
-						defaultConfig.Credentials.Password = inputPassword
+		// Keep the original terminal wizard for CLI-only startup. GUI startup creates
+		// the template immediately so the dashboard can show setup instructions.
+		if !shouldStartGUI() {
+			log.Print(lg("Settings", "create", color.HiCyanString, "Would you like to enter settings info now? [Y/N]: "))
+			reader := bufio.NewReader(os.Stdin)
+			inputCredsYN, _ := reader.ReadString('\n')
+			inputCredsYN = strings.ReplaceAll(inputCredsYN, "\n", "")
+			inputCredsYN = strings.ReplaceAll(inputCredsYN, "\r", "")
+			if strings.Contains(strings.ToLower(inputCredsYN), "y") {
+			EnterCreds:
+				log.Print(color.HiCyanString("Token or Login? [\"token\"/\"login\"]: "))
+				inputCreds, _ := reader.ReadString('\n')
+				inputCreds = strings.ReplaceAll(inputCreds, "\n", "")
+				inputCreds = strings.ReplaceAll(inputCreds, "\r", "")
+				if strings.Contains(strings.ToLower(inputCreds), "token") {
+				EnterToken:
+					log.Print(color.HiCyanString("Enter token: "))
+					inputToken, _ := reader.ReadString('\n')
+					inputToken = strings.ReplaceAll(inputToken, "\n", "")
+					inputToken = strings.ReplaceAll(inputToken, "\r", "")
+					if inputToken != "" {
+						defaultConfig.Credentials.Token = inputToken
 					} else {
-						log.Println(lg("Settings", "create", color.HiRedString, "Please input password..."))
-						goto EnterPassword
+						log.Println(lg("Settings", "create", color.HiRedString, "Please input token..."))
+						goto EnterToken
+					}
+				} else if strings.Contains(strings.ToLower(inputCreds), "login") {
+				EnterEmail:
+					log.Print(color.HiCyanString("Enter email: "))
+					inputEmail, _ := reader.ReadString('\n')
+					inputEmail = strings.ReplaceAll(inputEmail, "\n", "")
+					inputEmail = strings.ReplaceAll(inputEmail, "\r", "")
+					if strings.Contains(inputEmail, "@") {
+						defaultConfig.Credentials.Email = inputEmail
+					EnterPassword:
+						log.Print(color.HiCyanString("Enter password: "))
+						inputPassword, _ := reader.ReadString('\n')
+						inputPassword = strings.ReplaceAll(inputPassword, "\n", "")
+						inputPassword = strings.ReplaceAll(inputPassword, "\r", "")
+						if inputPassword != "" {
+							defaultConfig.Credentials.Password = inputPassword
+						} else {
+							log.Println(lg("Settings", "create", color.HiRedString, "Please input password..."))
+							goto EnterPassword
+						}
+					} else {
+						log.Println(lg("Settings", "create", color.HiRedString, "Please input email..."))
+						goto EnterEmail
 					}
 				} else {
-					log.Println(lg("Settings", "create", color.HiRedString, "Please input email..."))
-					goto EnterEmail
+					log.Println(lg("Settings", "create", color.HiRedString, "Please input \"token\" or \"login\"..."))
+					goto EnterCreds
 				}
-			} else {
-				log.Println(lg("Settings", "create", color.HiRedString, "Please input \"token\" or \"login\"..."))
-				goto EnterCreds
-			}
 
-		EnterAdmin:
-			log.Print(color.HiCyanString("Input your Discord User ID: "))
-			inputAdmin, _ := reader.ReadString('\n')
-			inputAdmin = strings.ReplaceAll(inputAdmin, "\n", "")
-			inputAdmin = strings.ReplaceAll(inputAdmin, "\r", "")
-			if isNumeric(inputAdmin) {
-				defaultConfig.Admins = []string{inputAdmin}
-			} else {
-				log.Println(lg("Settings", "create", color.HiRedString, "Please input your Discord User ID..."))
-				goto EnterAdmin
-			}
+			EnterAdmin:
+				log.Print(color.HiCyanString("Input your Discord User ID: "))
+				inputAdmin, _ := reader.ReadString('\n')
+				inputAdmin = strings.ReplaceAll(inputAdmin, "\n", "")
+				inputAdmin = strings.ReplaceAll(inputAdmin, "\r", "")
+				if isNumeric(inputAdmin) {
+					defaultConfig.Admins = []string{inputAdmin}
+				} else {
+					log.Println(lg("Settings", "create", color.HiRedString, "Please input your Discord User ID..."))
+					goto EnterAdmin
+				}
 
-			//TODO: Base channel setup? Would be kind of annoying and may limit options
-			//TODO: Admin channel setup?
+				//TODO: Base channel setup? Would be kind of annoying and may limit options
+				//TODO: Admin channel setup?
+			}
 		}
 	}
 
@@ -992,7 +1246,7 @@ func createConfig() {
 	if err != nil {
 		log.Println(lg("Settings", "create", color.HiRedString, "Failed to format new settings...\t%s", err))
 	} else {
-		err := os.WriteFile(configFile, defaultJSON, 0644)
+		err := os.WriteFile(configFile, defaultJSON, 0600)
 		if err != nil {
 			log.Println(lg("Settings", "create", color.HiRedString, "Failed to save new settings file...\t%s", err))
 		} else {
@@ -1001,7 +1255,7 @@ func createConfig() {
 				"Please save your credentials & info into \"%s\" then restart...", configFile))
 			log.Println(lg("Settings", "create", color.MagentaString,
 				"You DO NOT NEED token *AND* email/password, just one OR the other."))
-			log.Println(lg("Settings", "create", color.MagentaString,
+			log.Println(lg("Settings", "create", color.MagentaString, "%s",
 				"THERE ARE MANY HIDDEN SETTINGS AVAILABLE, SEE THE GITHUB README github.com/"+projectRepoBase))
 		}
 	}
@@ -1259,15 +1513,22 @@ func sourceDefault(source *configurationSource) {
 		source.LogMessages = config.LogMessages
 	}
 
-	// LAZY CHECKS
-	if source.Duplo != nil {
-		if *source.Duplo {
-			sourceHasDuplo = true
-		}
-	}
 }
 
-var sourceHasDuplo bool = false
+func configUsesDuplo() bool {
+	if config.Duplo {
+		return true
+	}
+	for _, source := range append(append(append(append([]configurationSource{}, config.Users...), config.Servers...), config.Categories...), config.Channels...) {
+		if source.Duplo != nil && *source.Duplo {
+			return true
+		}
+	}
+	if config.All != nil && config.All.Duplo != nil && *config.All.Duplo {
+		return true
+	}
+	return false
+}
 
 func adminChannelDefault(channel *configurationAdminChannel) {
 	if channel.LogProgram == nil {
@@ -1286,19 +1547,23 @@ func adminChannelDefault(channel *configurationAdminChannel) {
 
 // Checks if message author is a specified bot admin.
 func isBotAdmin(m *discordgo.Message) bool {
+	if m == nil || m.Author == nil {
+		return false
+	}
 	// No Admins or Admin Channels
 	if len(config.Admins) == 0 && len(config.AdminChannels) == 0 {
-		return true
+		ownID := discordUserID()
+		return ownID != "" && m.Author.ID == ownID
 	}
 	// configurationAdminChannel.UnlockCommands Bypass
 	if isAdminChannelRegistered(m.ChannelID) {
 		sourceConfig := getAdminChannelConfig(m.ChannelID)
-		if *sourceConfig.UnlockCommands {
+		if sourceConfig.UnlockCommands != nil && *sourceConfig.UnlockCommands {
 			return true
 		}
 	}
 
-	return m.Author.ID == botUser.ID || stringInSlice(m.Author.ID, config.Admins)
+	return m.Author.ID == discordUserID() || stringInSlice(m.Author.ID, config.Admins)
 }
 
 //#endregion
@@ -1308,12 +1573,29 @@ func isBotAdmin(m *discordgo.Message) bool {
 var emptySourceConfig configurationSource = configurationSource{}
 
 func getSource(m *discordgo.Message) configurationSource {
+	if m == nil {
+		return emptySourceConfig
+	}
+	// Exact channel matches do not require a Discord API lookup. Besides being
+	// faster, this keeps configured channels usable during a transient state miss.
+	for _, item := range config.Channels {
+		if m.ChannelID == item.ChannelID {
+			return item
+		}
+		if item.ChannelIDs != nil && stringInSlice(m.ChannelID, *item.ChannelIDs) {
+			return item
+		}
+	}
+	if bot == nil || bot.State == nil {
+		return emptySourceConfig
+	}
 	chinfo, err := bot.State.Channel(m.ChannelID)
 	if err != nil {
 		chinfo, err = bot.Channel(m.ChannelID)
 	}
 	if err != nil || chinfo == nil {
 		log.Println(lg("Settings", "getSource", color.HiRedString, "Failed to find channel info...\t%s", err))
+		return emptySourceConfig
 	}
 
 	// Channel
@@ -1366,7 +1648,7 @@ func getSource(m *discordgo.Message) configurationSource {
 		if err != nil {
 			guild, err = bot.Guild(testID)
 		}
-		if err == nil {
+		if err == nil && guild != nil {
 			for _, channel := range guild.Channels {
 				if m.ChannelID == channel.ID || // Standard text channel
 					chinfo.ParentID == channel.ID { // Nested text channel
@@ -1499,13 +1781,16 @@ func getAdminChannelConfig(ChannelID string) configurationAdminChannel {
 }
 
 func isCommandableChannel(m *discordgo.Message) bool {
+	if m == nil || m.Author == nil {
+		return false
+	}
 	if config.AllowGeneralCommands {
 		return true
 	}
 	if isAdminChannelRegistered(m.ChannelID) {
 		return true
 	} else if sourceConfig := getSource(m); sourceConfig != emptySourceConfig {
-		if *sourceConfig.AllowCommands || isBotAdmin(m) || m.Author.ID == bot.State.User.ID {
+		if (sourceConfig.AllowCommands != nil && *sourceConfig.AllowCommands) || isBotAdmin(m) || m.Author.ID == discordUserID() {
 			return true
 		}
 	}
@@ -1519,7 +1804,8 @@ func getBoundUsers() []string {
 			if !stringInSlice(item.UserID, users) {
 				users = append(users, item.UserID)
 			}
-		} else if item.UserIDs != nil {
+		}
+		if item.UserIDs != nil {
 			for _, subuser := range *item.UserIDs {
 				if subuser != "" {
 					if !stringInSlice(subuser, users) {
@@ -1543,7 +1829,8 @@ func getBoundServers() []string {
 			if !stringInSlice(item.ServerID, servers) {
 				servers = append(servers, item.ServerID)
 			}
-		} else if item.ServerIDs != nil {
+		}
+		if item.ServerIDs != nil {
 			for _, subserver := range *item.ServerIDs {
 				if subserver != "" {
 					if !stringInSlice(subserver, servers) {
@@ -1567,7 +1854,8 @@ func getBoundChannels() []string {
 			if !stringInSlice(item.ChannelID, channels) {
 				channels = append(channels, item.ChannelID)
 			}
-		} else if item.ChannelIDs != nil {
+		}
+		if item.ChannelIDs != nil {
 			for _, subchannel := range *item.ChannelIDs {
 				if subchannel != "" {
 					if !stringInSlice(subchannel, channels) {
@@ -1591,7 +1879,8 @@ func getBoundCategories() []string {
 			if !stringInSlice(item.CategoryID, categories) {
 				categories = append(categories, item.CategoryID)
 			}
-		} else if item.CategoryIDs != nil {
+		}
+		if item.CategoryIDs != nil {
 			for _, subcategory := range *item.CategoryIDs {
 				if subcategory != "" {
 					if !stringInSlice(subcategory, categories) {
@@ -1616,7 +1905,10 @@ type registeredChannelSource struct {
 func getAllRegisteredChannels() []registeredChannelSource {
 	var channels []registeredChannelSource
 	if config.All != nil { // ALL MODE
-		for _, guild := range bot.State.Guilds {
+		if bot == nil || bot.State == nil {
+			return channels
+		}
+		for _, guild := range discordGuildsSnapshot() {
 			if config.AllBlacklistServers != nil {
 				if stringInSlice(guild.ID, *config.AllBlacklistServers) {
 					continue
@@ -1635,13 +1927,16 @@ func getAllRegisteredChannels() []registeredChannelSource {
 	} else { // STANDARD MODE
 		// Compile all channels sourced from config servers
 		for _, server := range config.Servers {
+			if bot == nil || bot.State == nil {
+				break
+			}
 			if server.ServerIDs != nil {
 				for _, subserver := range *server.ServerIDs {
 					guild, err := bot.State.Guild(subserver)
 					if err != nil {
 						guild, err = bot.Guild(subserver)
 					}
-					if err == nil {
+					if err == nil && guild != nil {
 						for _, channel := range guild.Channels {
 							if hasPerms(channel.ID, discordgo.PermissionReadMessageHistory) {
 								channels = append(channels, registeredChannelSource{channel.ID, server})
@@ -1649,12 +1944,13 @@ func getAllRegisteredChannels() []registeredChannelSource {
 						}
 					}
 				}
-			} else if isNumeric(server.ServerID) {
+			}
+			if isNumeric(server.ServerID) {
 				guild, err := bot.State.Guild(server.ServerID)
 				if err != nil {
 					guild, err = bot.Guild(server.ServerID)
 				}
-				if err == nil {
+				if err == nil && guild != nil {
 					for _, channel := range guild.Channels {
 						if hasPerms(channel.ID, discordgo.PermissionReadMessageHistory) {
 							channels = append(channels, registeredChannelSource{channel.ID, server})
@@ -1664,7 +1960,8 @@ func getAllRegisteredChannels() []registeredChannelSource {
 			}
 		}
 		// Compile all config channels under categories, no practical way to poll these other than checking state.
-		for _, guild := range bot.State.Guilds {
+		guilds := discordGuildsSnapshot()
+		for _, guild := range guilds {
 			for _, channel := range guild.Channels {
 				for _, source := range config.Categories {
 					if source.CategoryIDs != nil {
@@ -1673,7 +1970,8 @@ func getAllRegisteredChannels() []registeredChannelSource {
 								channels = append(channels, registeredChannelSource{channel.ID, source})
 							}
 						}
-					} else if isNumeric(source.CategoryID) {
+					}
+					if isNumeric(source.CategoryID) {
 						if channel.ParentID == source.CategoryID {
 							channels = append(channels, registeredChannelSource{channel.ID, source})
 						}
@@ -1687,7 +1985,8 @@ func getAllRegisteredChannels() []registeredChannelSource {
 				for _, subchannel := range *channel.ChannelIDs {
 					channels = append(channels, registeredChannelSource{subchannel, channel})
 				}
-			} else if isNumeric(channel.ChannelID) {
+			}
+			if isNumeric(channel.ChannelID) {
 				channels = append(channels, registeredChannelSource{channel.ChannelID, channel})
 			}
 		}

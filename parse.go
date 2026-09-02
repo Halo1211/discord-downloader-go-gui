@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,10 +27,54 @@ const (
 	sneakyUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
 )
 
+func ensureSessionCacheDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0700)
+}
+
+func exportTwitterSession() error {
+	if twitterScraper == nil {
+		return errors.New("Twitter scraper is not initialized")
+	}
+	if err := ensureSessionCacheDir(pathCacheTwitter); err != nil {
+		return err
+	}
+	cookies, err := json.Marshal(twitterScraper.GetCookies())
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pathCacheTwitter, cookies, 0600)
+}
+
+func exportInstagramSession() error {
+	if instagramClient == nil {
+		return errors.New("Instagram client is not initialized")
+	}
+	if err := ensureSessionCacheDir(pathCacheInstagram); err != nil {
+		return err
+	}
+	return instagramClient.Export(pathCacheInstagram)
+}
+
+func instagramLoginNeeds2FA(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "two factor") || strings.Contains(lower, "two_factor")
+}
+
 func botLoadAPIs() {
+	defer mainWg.Done()
+	twitterConnected = false
+	instagramConnected = false
+
 	// Twitter API
-	if *config.Credentials.TwitterAuthEnabled {
-		go func() {
+	if config.Credentials.TwitterAuthEnabled != nil && *config.Credentials.TwitterAuthEnabled {
+		{
 			twitterScraper = twitterscraper.New()
 			if (config.Credentials.TwitterUsername != "" &&
 				config.Credentials.TwitterPassword != "") ||
@@ -45,7 +90,7 @@ func botLoadAPIs() {
 							if err != nil {
 								log.Println(lg("API", "Twitter", color.HiRedString, "Error setting proxy: %s", err.Error()))
 							} else {
-								log.Println(lg("API", "Twitter", color.HiMagentaString, "Proxy set to "+config.Credentials.TwitterProxy))
+								log.Println(lg("API", "Twitter", color.HiMagentaString, "%s", "Proxy set to "+config.Credentials.TwitterProxy))
 							}
 						}
 					}
@@ -57,6 +102,7 @@ func botLoadAPIs() {
 					if err != nil {
 						return err
 					}
+					defer f.Close()
 					var cookies []*http.Cookie
 					err = json.NewDecoder(f).Decode(&cookies)
 					if err != nil {
@@ -68,20 +114,6 @@ func botLoadAPIs() {
 					if err != nil {
 						return err
 					}
-					return nil
-				}
-
-				twitterExport := func() error {
-					cookies := twitterScraper.GetCookies()
-					js, err := json.Marshal(cookies)
-					if err != nil {
-						return err
-					}
-					f, err := os.Create(pathCacheTwitter)
-					if err != nil {
-						return err
-					}
-					f.Write(js)
 					return nil
 				}
 
@@ -130,9 +162,11 @@ func botLoadAPIs() {
 						}
 					} else {
 						if twitterScraper.IsLoggedIn() {
-							log.Println(lg("API", "Twitter", color.HiMagentaString, fmt.Sprintf("Connected to @%s via new login", config.Credentials.TwitterUsername)))
+							log.Println(lg("API", "Twitter", color.HiMagentaString, "%s", fmt.Sprintf("Connected to @%s via new login", config.Credentials.TwitterUsername)))
 							twitterConnected = true
-							defer twitterExport()
+							if err := exportTwitterSession(); err != nil {
+								log.Println(lg("API", "Twitter", color.HiYellowString, "Could not cache session: %s", err))
+							}
 						} else {
 							log.Println(lg("API", "Twitter", color.HiRedString,
 								"Scraper login seemed successful but bot is not logged in, Twitter (X) parsing may not work..."))
@@ -151,22 +185,22 @@ func botLoadAPIs() {
 				log.Println(lg("API", "Twitter", color.MagentaString,
 					"Twitter (X) login missing, the bot will not fetch this media..."))
 			}
-		}()
+		}
 	} else {
 		log.Println(lg("API", "Twitter", color.RedString,
 			"TWITTER AUTHENTICATION IS DISABLED IN SETTINGS..."))
 	}
 
 	// Instagram API
-	if *config.Credentials.InstagramAuthEnabled {
-		go func() {
+	if config.Credentials.InstagramAuthEnabled != nil && *config.Credentials.InstagramAuthEnabled {
+		{
 			if config.Credentials.InstagramUsername != "" &&
 				config.Credentials.InstagramPassword != "" {
 				log.Println(lg("API", "Instagram", color.MagentaString, "Connecting..."))
 
 				// Proxy
 				instagramProxy := func(logIt bool) {
-					if config.Credentials.InstagramProxy != "" {
+					if instagramClient != nil && config.Credentials.InstagramProxy != "" {
 						insecure := false
 						if config.Credentials.InstagramProxyInsecure != nil {
 							insecure = *config.Credentials.InstagramProxyInsecure
@@ -179,11 +213,10 @@ func botLoadAPIs() {
 						if err != nil {
 							log.Println(lg("API", "Instagram", color.HiRedString, "Error setting proxy: %s", err.Error()))
 						} else {
-							log.Println(lg("API", "Instagram", color.HiMagentaString, "Proxy set to "+config.Credentials.InstagramProxy))
+							log.Println(lg("API", "Instagram", color.HiMagentaString, "%s", "Proxy set to "+config.Credentials.InstagramProxy))
 						}
 					}
 				}
-				instagramProxy(true)
 
 				// Login Loop
 				instagramLoginCount := 0
@@ -192,28 +225,34 @@ func botLoadAPIs() {
 				if instagramLoginCount > 1 {
 					time.Sleep(3 * time.Second)
 				}
-				if instagramClient, err = goinsta.Import(pathCacheInstagram); err != nil {
+				importedClient, importErr := goinsta.Import(pathCacheInstagram)
+				if importErr != nil {
 					instagramClient = goinsta.New(config.Credentials.InstagramUsername, config.Credentials.InstagramPassword)
+					instagramProxy(true)
 					if err := instagramClient.Login(); err != nil {
 						// 2fa
-						if strings.Contains(err.Error(), "two Factor Autentication required") {
+						if instagramLoginNeeds2FA(err) {
 							// Generate TOTP
+							totp := ""
 							if config.Credentials.InstagramTOTP != nil {
-								if *config.Credentials.InstagramTOTP != "" {
-									instagramClient.SetTOTPSeed(*config.Credentials.InstagramTOTP)
-									if err := instagramClient.TwoFactorInfo.Login2FA(); err != nil {
-										log.Println(lg("API", "Instagram", color.HiRedString, "2FA-Generated Login Error: %s", err.Error()))
-										if instagramLoginCount <= 3 {
-											goto do_instagram_login
-										} else {
-											log.Println(lg("API", "Instagram", color.HiRedString,
-												"Failed to login to Instagram, the bot will not fetch this media..."))
-										}
+								totp = *config.Credentials.InstagramTOTP
+							}
+							if totp != "" {
+								instagramClient.SetTOTPSeed(totp)
+								if err := instagramClient.TwoFactorInfo.Login2FA(); err != nil {
+									log.Println(lg("API", "Instagram", color.HiRedString, "2FA-Generated Login Error: %s", err.Error()))
+									if instagramLoginCount <= 3 {
+										goto do_instagram_login
 									} else {
-										log.Println(lg("API", "Instagram", color.HiMagentaString,
-											"Connected to @%s via new 2FA-Generated login", instagramClient.Account.Username))
-										instagramConnected = true
-										defer instagramClient.Export(pathCacheInstagram)
+										log.Println(lg("API", "Instagram", color.HiRedString,
+											"Failed to login to Instagram, the bot will not fetch this media..."))
+									}
+								} else {
+									log.Println(lg("API", "Instagram", color.HiMagentaString,
+										"Connected to @%s via new 2FA-Generated login", instagramClient.Account.Username))
+									instagramConnected = true
+									if err := exportInstagramSession(); err != nil {
+										log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
 									}
 								}
 							} else { // Manual TOTP
@@ -236,7 +275,9 @@ func botLoadAPIs() {
 										log.Println(lg("API", "Instagram", color.HiMagentaString,
 											"Connected to @%s via new 2FA-Code login", instagramClient.Account.Username))
 										instagramConnected = true
-										defer instagramClient.Export(pathCacheInstagram)
+										if err := exportInstagramSession(); err != nil {
+											log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
+										}
 									}
 								} else {
 									log.Println(lg("API", "Instagram", color.HiRedString,
@@ -256,37 +297,57 @@ func botLoadAPIs() {
 						log.Println(lg("API", "Instagram", color.HiMagentaString,
 							"Connected to @%s via new login", instagramClient.Account.Username))
 						instagramConnected = true
-						defer instagramClient.Export(pathCacheInstagram)
+						if err := exportInstagramSession(); err != nil {
+							log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
+						}
 					}
 				} else {
+					instagramClient = importedClient
+					instagramProxy(true)
 					log.Println(lg("API", "Instagram", color.HiMagentaString,
 						"Connected to @%s via cache", instagramClient.Account.Username))
 					instagramConnected = true
-				}
-				if instagramConnected {
-					instagramProxy(false)
 				}
 			} else {
 				log.Println(lg("API", "Instagram", color.MagentaString,
 					"Instagram login missing, the bot will not fetch this media..."))
 			}
-		}()
+		}
 	} else {
 		log.Println(lg("API", "Instagram", color.RedString,
 			"INSTAGRAM AUTHENTICATION IS DISABLED IN SETTINGS..."))
 	}
 
-	mainWg.Done()
 }
 
 //#region Twitter
 
 func getTwitterUrls(inputURL string) (map[string]string, error) {
-	parts := strings.Split(inputURL, ":")
-	if len(parts) < 2 {
-		return nil, errors.New("unable to parse Twitter URL")
+	parsedURL, err := url.Parse(inputURL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse Twitter media URL: %w", err)
 	}
-	return map[string]string{"https:" + parts[1] + ":orig": filenameFromURL(parts[1])}, nil
+	host := strings.ToLower(parsedURL.Hostname())
+	if host != "pbs.twimg.com" && !(strings.HasPrefix(host, "pbs-") && strings.HasSuffix(host, ".twimg.com")) {
+		return nil, errors.New("URL is not a Twitter media URL")
+	}
+
+	parsedURL.Fragment = ""
+	query := parsedURL.Query()
+	if query.Get("format") != "" {
+		query.Set("name", "orig")
+		parsedURL.RawQuery = query.Encode()
+	} else {
+		// Older Twitter media URLs use a :large/:orig suffix instead of query parameters.
+		lastSlash := strings.LastIndex(parsedURL.Path, "/")
+		if colon := strings.LastIndex(parsedURL.Path, ":"); colon > lastSlash {
+			parsedURL.Path = parsedURL.Path[:colon]
+		}
+		parsedURL.Path += ":orig"
+	}
+
+	mediaURL := parsedURL.String()
+	return map[string]string{mediaURL: filenameFromURL(mediaURL)}, nil
 }
 
 func getTwitterStatusUrls(inputURL string, m *discordgo.Message) (map[string]string, error) {
@@ -298,50 +359,61 @@ func getTwitterStatusUrls(inputURL string, m *discordgo.Message) (map[string]str
 	}
 
 	matches := regexUrlTwitterStatus.FindStringSubmatch(inputURL)
-	_, err := strconv.ParseInt(matches[4], 10, 64)
-	if err != nil {
+	if len(matches) < 5 {
+		return nil, errors.New("unable to parse Twitter status URL")
+	}
+	if _, err := strconv.ParseInt(matches[4], 10, 64); err != nil {
 		return nil, err
 	}
-
-	// Sometimes it fails to fetch actual content on first request.
-	retryCount := 0
-retryTwitter:
-	retryCount++
-	tweet, err := twitterScraper.GetTweet(matches[4])
-	if err != nil {
-		return nil, err
+	if twitterScraper == nil {
+		return nil, errors.New("Twitter scraper is not initialized")
 	}
 
-	links := make(map[string]string)
-	for _, photo := range tweet.Photos {
-		foundUrls := getParsedLinks(photo.URL, m)
-		for foundUrlKey, foundUrlValue := range foundUrls {
-			links[foundUrlKey] = foundUrlValue
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		tweet, err := twitterScraper.GetTweet(matches[4])
+		if err != nil {
+			lastErr = err
+		} else if tweet != nil {
+			links := make(map[string]string)
+			for _, photo := range tweet.Photos {
+				if photo.URL == "" {
+					continue
+				}
+				for foundURL, filename := range getParsedLinks(photo.URL, m) {
+					links[foundURL] = filename
+				}
+			}
+			for _, video := range tweet.Videos {
+				if video.URL == "" {
+					continue
+				}
+				for foundURL, filename := range getParsedLinks(video.URL, m) {
+					links[foundURL] = filename
+				}
+			}
+			for _, gif := range tweet.GIFs {
+				if gif.URL == "" {
+					continue
+				}
+				for foundURL, filename := range getParsedLinks(gif.URL, m) {
+					links[foundURL] = filename
+				}
+			}
+			if len(links) > 0 {
+				return links, nil
+			}
+			lastErr = errors.New("Twitter status contains no downloadable media")
 		}
-	}
-	for _, video := range tweet.Videos {
-		foundUrls := getParsedLinks(video.URL, m)
-		for foundUrlKey, foundUrlValue := range foundUrls {
-			links[foundUrlKey] = foundUrlValue
-		}
-	}
-	for _, gif := range tweet.GIFs {
-		foundUrls := getParsedLinks(gif.URL, m)
-		for foundUrlKey, foundUrlValue := range foundUrls {
-			links[foundUrlKey] = foundUrlValue
-		}
-	}
 
-	// Sometimes it fails to fetch actual content on first request.
-	if len(links) == 0 && retryCount < 3 {
-		if config.Debug {
-			log.Println(lg("API", "Twitter", color.HiRedString, "No content found in post, retrying %s...", matches[4]))
+		if attempt < 2 {
+			if config.Debug {
+				log.Println(lg("API", "Twitter", color.HiRedString, "No content found in post, retrying %s...", matches[4]))
+			}
+			time.Sleep(1 * time.Second)
 		}
-		time.Sleep(1 * time.Second)
-		goto retryTwitter
 	}
-
-	return links, nil
+	return nil, lastErr
 }
 
 //#endregion
@@ -353,47 +425,73 @@ func getInstagramUrls(inputURL string, m *discordgo.Message) (map[string]string,
 		return nil, errors.New("invalid Instagram API credentials")
 	}
 
-	links := make(map[string]string)
-
-	// fix
-	shortcode := inputURL
-	if strings.Contains(shortcode, ".com/p/") {
-		shortcode = shortcode[strings.Index(shortcode, ".com/p/")+7:]
+	parsedURL, err := url.Parse(inputURL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse Instagram URL: %w", err)
 	}
-	if strings.Contains(shortcode, ".com/reel/") {
-		shortcode = shortcode[strings.Index(shortcode, ".com/reel/")+10:]
+	segments := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
+	shortcode := ""
+	for index, segment := range segments {
+		if (segment == "p" || segment == "reel" || segment == "tv") && index+1 < len(segments) {
+			shortcode = segments[index+1]
+			break
+		}
 	}
-	shortcode = strings.ReplaceAll(shortcode, "/", "")
+	if shortcode == "" {
+		return nil, errors.New("unable to find Instagram shortcode")
+	}
 
-	// fetch
 	mediaID, err := goinsta.MediaIDFromShortID(shortcode)
-	if err == nil {
-		media, err := instagramClient.GetMedia(mediaID)
-		if err != nil {
-			return nil, err
-		} else {
-			postType := media.Items[0].MediaToString()
-			if postType == "carousel" {
-				for index, item := range media.Items[0].CarouselMedia {
-					itemType := item.MediaToString()
-					if itemType == "video" {
-						url := item.Videos[0].URL
-						links[url] = fmt.Sprintf("%s %d %s", shortcode, index, media.Items[0].User.Username)
-					} else if itemType == "photo" {
-						url := item.Images.GetBest()
-						links[url] = fmt.Sprintf("%s %d %s", shortcode, index, media.Items[0].User.Username)
-					}
-				}
-			} else if postType == "video" {
-				url := media.Items[0].Videos[0].URL
-				links[url] = fmt.Sprintf("%s %s", shortcode, media.Items[0].User.Username)
-			} else if postType == "photo" {
-				url := media.Items[0].Images.GetBest()
-				links[url] = fmt.Sprintf("%s %s", shortcode, media.Items[0].User.Username)
-			}
+	if err != nil {
+		return nil, err
+	}
+	media, err := instagramClient.GetMedia(mediaID)
+	if err != nil {
+		return nil, err
+	}
+	if len(media.Items) == 0 {
+		return nil, errors.New("Instagram post contains no media items")
+	}
+
+	item := media.Items[0]
+	username := item.User.Username
+	if username == "" {
+		username = "instagram"
+	}
+	links := make(map[string]string)
+	addVideo := func(videoURL, filename string) {
+		if videoURL != "" {
+			links[videoURL] = filename
+		}
+	}
+	addPhoto := func(photoURL, filename string) {
+		if photoURL != "" {
+			links[photoURL] = filename
 		}
 	}
 
+	postType := item.MediaToString()
+	if postType == "carousel" {
+		for index, carouselItem := range item.CarouselMedia {
+			filename := fmt.Sprintf("%s %d %s", shortcode, index, username)
+			if carouselItem.MediaToString() == "video" {
+				if len(carouselItem.Videos) > 0 {
+					addVideo(carouselItem.Videos[0].URL, filename)
+				}
+			} else {
+				addPhoto(carouselItem.Images.GetBest(), filename)
+			}
+		}
+	} else if postType == "video" {
+		if len(item.Videos) > 0 {
+			addVideo(item.Videos[0].URL, fmt.Sprintf("%s %s", shortcode, username))
+		}
+	} else {
+		addPhoto(item.Images.GetBest(), fmt.Sprintf("%s %s", shortcode, username))
+	}
+	if len(links) == 0 {
+		return nil, errors.New("Instagram post contains no downloadable media")
+	}
 	return links, nil
 }
 
@@ -421,7 +519,9 @@ func getImgurAlbumUrls(url string) (map[string]string, error) {
 	headers := make(map[string]string)
 	headers["Authorization"] = "Client-ID " + imgurClientID
 	imgurAlbumObject := new(imgurAlbumObject)
-	getJSONwithHeaders("https://api.imgur.com/3/album/"+albumId+"/images", imgurAlbumObject, headers)
+	if err := getJSONwithHeaders("https://api.imgur.com/3/album/"+albumId+"/images", imgurAlbumObject, headers); err != nil {
+		return getImgurSingleUrls(url)
+	}
 	links := make(map[string]string)
 	for _, v := range imgurAlbumObject.Data {
 		links[v.Link] = ""
@@ -459,13 +559,18 @@ type streamableObject struct {
 
 func getStreamableUrls(url string) (map[string]string, error) {
 	matches := regexUrlStreamable.FindStringSubmatch(url)
+	if len(matches) < 4 {
+		return nil, errors.New("unable to parse Streamable URL")
+	}
 	shortcode := matches[3]
 	if shortcode == "" {
 		return nil, errors.New("unable to get shortcode from URL")
 	}
 	reqUrl := fmt.Sprintf("https://api.streamable.com/videos/%s", shortcode)
 	streamable := new(streamableObject)
-	getJSON(reqUrl, streamable)
+	if err := getJSON(reqUrl, streamable); err != nil {
+		return nil, err
+	}
 	if streamable.Status != 2 || streamable.Files.Mp4.URL == "" {
 		return nil, errors.New("streamable object has no download candidate")
 	}
@@ -493,11 +598,13 @@ func getGfycatUrls(url string) (map[string]string, error) {
 	if len(parts) < 3 {
 		return nil, errors.New("unable to parse Gfycat URL")
 	}
-	gfycatId := parts[len(parts)-1]
+	gfycatId := strings.TrimSuffix(parts[len(parts)-1], ".html")
 	gfycatObject := new(gfycatObject)
-	getJSON("https://api.gfycat.com/v1/gfycats/"+gfycatId, gfycatObject)
+	if err := getJSON("https://api.gfycat.com/v1/gfycats/"+gfycatId, gfycatObject); err != nil {
+		return nil, err
+	}
 	gfycatUrl := gfycatObject.GfyItem.Mp4URL
-	if url == "" {
+	if gfycatUrl == "" {
 		return nil, errors.New("failed to read response from Gfycat")
 	}
 	return map[string]string{gfycatUrl: ""}, nil
@@ -530,7 +637,9 @@ func getFlickrUrlFromPhotoId(photoId string) string {
 	reqUrl := fmt.Sprintf("https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=%s&api_key=%s&photo_id=%s",
 		"flickr.photos.getSizes", config.Credentials.FlickrApiKey, photoId)
 	flickrPhoto := new(flickrPhotoObject)
-	getJSON(reqUrl, flickrPhoto)
+	if err := getJSON(reqUrl, flickrPhoto); err != nil {
+		return ""
+	}
 	var bestSize flickrPhotoSizeObject
 	for _, size := range flickrPhoto.Sizes.Size {
 		if bestSize.Label == "" {
@@ -549,6 +658,9 @@ func getFlickrPhotoUrls(url string) (map[string]string, error) {
 		return nil, errors.New("invalid Flickr API Key Set")
 	}
 	matches := regexUrlFlickrPhoto.FindStringSubmatch(url)
+	if len(matches) < 6 {
+		return nil, errors.New("unable to parse Flickr photo URL")
+	}
 	photoId := matches[5]
 	if photoId == "" {
 		return nil, errors.New("unable to get Photo ID from URL")
@@ -598,7 +710,9 @@ func getFlickrAlbumUrls(url string) (map[string]string, error) {
 	reqUrl := fmt.Sprintf("https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=%s&api_key=%s&photoset_id=%s&per_page=500",
 		"flickr.photosets.getPhotos", config.Credentials.FlickrApiKey, albumId)
 	flickrAlbum := new(flickrAlbumObject)
-	getJSON(reqUrl, flickrAlbum)
+	if err := getJSON(reqUrl, flickrAlbum); err != nil {
+		return nil, err
+	}
 	links := make(map[string]string)
 	for _, photo := range flickrAlbum.Photoset.Photo {
 		links[getFlickrUrlFromPhotoId(photo.ID)] = ""
@@ -607,9 +721,16 @@ func getFlickrAlbumUrls(url string) (map[string]string, error) {
 }
 
 func getFlickrAlbumShortUrls(url string) (map[string]string, error) {
-	result, err := http.Get(url)
+	result, err := jsonHTTPClient.Get(url)
 	if err != nil {
 		return nil, errors.New("Error getting long URL from shortened Flickr Album URL: " + err.Error())
+	}
+	defer result.Body.Close()
+	if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("short Flickr Album URL returned HTTP status %s", result.Status)
+	}
+	if result.Request == nil || result.Request.URL == nil {
+		return nil, errors.New("short Flickr Album URL did not redirect to a valid URL")
 	}
 	if regexUrlFlickrAlbum.MatchString(result.Request.URL.String()) {
 		return getFlickrAlbumUrls(result.Request.URL.String())
@@ -625,10 +746,21 @@ func getFlickrAlbumShortUrls(url string) (map[string]string, error) {
 // http://t1.daumcdn.net/cfile/tistory/[…] => http://t1.daumcdn.net/cfile/tistory/[…]
 // http://t1.daumcdn.net/cfile/tistory/[…]?original => as is
 func getTistoryUrls(link string) (map[string]string, error) {
-	if !strings.HasSuffix(link, "?original") {
-		link += "?original"
+	parsedURL, err := url.Parse(link)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse Tistory URL: %w", err)
 	}
-	return map[string]string{link: ""}, nil
+	if parsedURL.Scheme == "" || parsedURL.Hostname() == "" {
+		return nil, errors.New("unable to parse Tistory URL")
+	}
+	if _, exists := parsedURL.Query()["original"]; !exists {
+		if parsedURL.RawQuery == "" {
+			parsedURL.RawQuery = "original"
+		} else {
+			parsedURL.RawQuery += "&original"
+		}
+	}
+	return map[string]string{parsedURL.String(): ""}, nil
 }
 
 func getLegacyTistoryUrls(link string) (map[string]string, error) {
@@ -637,7 +769,11 @@ func getLegacyTistoryUrls(link string) (map[string]string, error) {
 }
 
 func getTistoryWithCDNUrls(urlI string) (map[string]string, error) {
-	parameters, _ := url.ParseQuery(urlI)
+	parsedURL, err := url.Parse(urlI)
+	if err != nil {
+		return nil, err
+	}
+	parameters := parsedURL.Query()
 	if val, ok := parameters["fname"]; ok {
 		if len(val) > 0 {
 			if regexUrlTistoryLegacy.MatchString(val[0]) {
@@ -649,7 +785,7 @@ func getTistoryWithCDNUrls(urlI string) (map[string]string, error) {
 }
 
 func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
-	client := new(http.Client)
+	client := jsonHTTPClient
 	request, err := http.NewRequest("HEAD", url, nil)
 	if err != nil {
 		return nil, err
@@ -660,10 +796,14 @@ func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer respHead.Body.Close()
+	if respHead.StatusCode < http.StatusOK || respHead.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("Tistory page returned HTTP status %s", respHead.Status)
+	}
 
 	contentType := ""
 	for headerKey, headerValue := range respHead.Header {
-		if headerKey == "Content-Type" {
+		if strings.EqualFold(headerKey, "Content-Type") && len(headerValue) > 0 {
 			contentType = headerValue[0]
 		}
 	}
@@ -671,7 +811,7 @@ func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 		return nil, nil
 	}
 
-	request, err = http.NewRequest("GET", url, nil)
+	request, err = http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -681,8 +821,12 @@ func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("Tistory page returned HTTP status %s", resp.Status)
+	}
 
-	doc, err := goquery.NewDocumentFromResponse(resp)
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -726,7 +870,13 @@ func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 type redditThreadObject []struct {
 	Kind string `json:"kind"`
 	Data struct {
-		Children interface{} `json:"children"`
+		Children []struct {
+			Data struct {
+				URL       string `json:"url_overridden_by_dest"`
+				Subreddit string `json:"subreddit"`
+				ID        string `json:"id"`
+			} `json:"data"`
+		} `json:"children"`
 	} `json:"data"`
 }
 
@@ -743,12 +893,13 @@ func getRedditPostUrls(link string) (map[string]string, error) {
 		return nil, fmt.Errorf("failed to parse json from reddit post:\t%s", err)
 	}
 
-	redditPost := (*redditThread)[0].Data.Children.([]interface{})[0].(map[string]interface{})
-	redditPostData := redditPost["data"].(map[string]interface{})
-	if redditPostData["url_overridden_by_dest"] != nil {
-		redditLink := redditPostData["url_overridden_by_dest"].(string)
-		filename := fmt.Sprintf("Reddit-%s_%s %s", redditPostData["subreddit"].(string), redditPostData["id"].(string), filenameFromURL(redditLink))
-		return map[string]string{redditLink: filename}, nil
+	if len(*redditThread) == 0 || len((*redditThread)[0].Data.Children) == 0 {
+		return nil, errors.New("Reddit response contains no posts")
+	}
+	post := (*redditThread)[0].Data.Children[0].Data
+	if post.URL != "" {
+		filename := fmt.Sprintf("Reddit-%s_%s %s", post.Subreddit, post.ID, filenameFromURL(post.URL))
+		return map[string]string{post.URL: filename}, nil
 	}
 	return nil, nil
 }

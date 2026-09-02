@@ -1,0 +1,15 @@
+{
+  "credentials": {
+    "token": "REPLACE_WITH_YOUR_DISCORD_BOT_TOKEN"
+  },
+  "guiEnabled": true,
+  "guiAddress": "127.0.0.1:7744",
+  "guiOpenBrowser": true,
+  "guiAutoStart": false,
+  "save": true,
+  "all": {
+    "destination": "REPLACE_WITH_FOLDER_LOCATION_TO_DOWNLOAD_TO",
+    "enabled": true,
+    "save": true
+  }
+}

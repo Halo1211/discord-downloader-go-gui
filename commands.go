@@ -40,7 +40,7 @@ func handleCommands() *exrouter.Route {
 
 	//#region Utility Commands
 
-	go router.On("ping", func(ctx *exrouter.Context) {
+	router.On("ping", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 				log.Println(lg("Command", "Ping", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
@@ -87,7 +87,7 @@ func handleCommands() *exrouter.Route {
 		}
 	}).Cat("Utility").Alias("test").Desc("Pings the bot")
 
-	go router.On("help", func(ctx *exrouter.Context) {
+	router.On("help", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 				log.Println(lg("Command", "Help", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
@@ -119,7 +119,7 @@ func handleCommands() *exrouter.Route {
 
 	//#region Info Commands
 
-	go router.On("status", func(ctx *exrouter.Context) {
+	router.On("status", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 				log.Println(lg("Command", "Status", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
@@ -135,7 +135,7 @@ func handleCommands() *exrouter.Route {
 					"• **Heartbeat Latency —** %dms",
 					timeSince(startTime),
 					startTime.Format("03:04:05pm on Monday, January 2, 2006 (MST)"),
-					len(bot.State.Guilds),
+					discordGuildCount(),
 					getBoundChannelsCount(),
 					getBoundCategoriesCount(),
 					getBoundServersCount(),
@@ -155,7 +155,7 @@ func handleCommands() *exrouter.Route {
 		}
 	}).Cat("Info").Desc("Displays info regarding the current status of the bot")
 
-	go router.On("stats", func(ctx *exrouter.Context) {
+	router.On("stats", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 				log.Println(lg("Command", "Stats", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
@@ -184,7 +184,7 @@ func handleCommands() *exrouter.Route {
 
 	//#region Admin Commands
 
-	go router.On("history", func(ctx *exrouter.Context) {
+	router.On("history", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			// Vars
 			var all = false
@@ -200,7 +200,7 @@ func handleCommands() *exrouter.Route {
 			var since string
 			var sinceID string
 
-			if len(bot.State.Guilds) == 0 {
+			if discordGuildCount() == 0 {
 				log.Println(lg("Command", "History", color.HiRedString, "WARNING: Something is wrong with your Discord cache. This can result in missed channels..."))
 			}
 
@@ -242,6 +242,8 @@ func handleCommands() *exrouter.Route {
 					//MARKER: history jobs list
 
 					// 1st
+					historyJobCnt, historyJobCntWaiting, historyJobCntRunning,
+						historyJobCntAborted, historyJobCntErrored, historyJobCntCompleted := getHistoryJobStats()
 					output := fmt.Sprintf("**CURRENT HISTORY JOBS** ~ `%d total, %d running",
 						historyJobCnt, historyJobCntRunning)
 					outputC := fmt.Sprintf("CURRENT HISTORY JOBS ~ %d total, %d running",
@@ -267,11 +269,11 @@ func handleCommands() *exrouter.Route {
 						outputC += t
 					}
 					safeReply(ctx, output+"`")
-					log.Println(lg("Command", "History", color.HiCyanString, outputC))
+					log.Println(lg("Command", "History", color.HiCyanString, "%s", outputC))
 
 					// Following
 					output = ""
-					for pair := historyJobs.Oldest(); pair != nil; pair = pair.Next() {
+					for _, pair := range historyJobs.Snapshot() {
 						channelID := pair.Key
 						job := pair.Value
 						jobSourceName, jobChannelName := channelDisplay(channelID)
@@ -288,7 +290,7 @@ func handleCommands() *exrouter.Route {
 							goto redothismath
 						}
 						output += newline
-						log.Println(lg("Command", "History", color.HiCyanString,
+						log.Println(lg("Command", "History", color.HiCyanString, "%s",
 							fmt.Sprintf("%s (%s) %s - %s, updated %s ago, added %s ago",
 								historyStatusLabel(job.Status), job.OriginUser, jobSourceName, jobChannelName,
 								timeSinceShort(job.Updated),
@@ -369,7 +371,7 @@ func handleCommands() *exrouter.Route {
 								if err == nil {
 									if ch.Type == discordgo.ChannelTypeGuildCategory {
 										// Category
-										for _, guild := range bot.State.Guilds {
+										for _, guild := range discordGuildsSnapshot() {
 											for _, ch := range guild.Channels {
 												if ch.ParentID == target {
 													channels = append(channels, ch.ID)
@@ -473,14 +475,7 @@ func handleCommands() *exrouter.Route {
 				} else { // IS BOT ADMIN
 					if shouldProcess { // PROCESS TREE; MARKER: history queue via cmd
 						if shouldAbort { // ABORT
-							if job, exists := historyJobs.Get(channel); exists &&
-								(job.Status == historyStatusRunning || job.Status == historyStatusWaiting) {
-								// DOWNLOADING, ABORTING
-								job.Status = historyStatusAbortRequested
-								if job.Status == historyStatusWaiting {
-									job.Status = historyStatusAbortCompleted
-								}
-								historyJobs.Set(channel, job)
+							if _, changed := historyJobs.RequestCancel(channel); changed {
 								log.Println(lg("Command", "History", color.CyanString,
 									"%s cancelled history cataloging for \"%s\"",
 									getUserIdentifier(*ctx.Msg.Author), channel))
@@ -490,19 +485,19 @@ func handleCommands() *exrouter.Route {
 									getUserIdentifier(*ctx.Msg.Author), channel))
 							}
 						} else { // RUN
-							if job, exists := historyJobs.Get(channel); !exists ||
-								(job.Status != historyStatusRunning && job.Status != historyStatusAbortRequested) {
-								job.Status = historyStatusWaiting
-								job.OriginChannel = ctx.Msg.ChannelID
-								job.OriginUser = getUserIdentifier(*ctx.Msg.Author)
-								job.TargetCommandingMessage = ctx.Msg
-								job.TargetChannelID = channel
-								job.TargetBefore = beforeID
-								job.TargetSince = sinceID
-								job.Updated = time.Now()
-								job.Added = time.Now()
-								historyJobs.Set(channel, job)
-							} else { // ALREADY RUNNING
+							now := time.Now()
+							queued := historyJobs.Queue(channel, historyJob{
+								Status:                  historyStatusWaiting,
+								OriginChannel:           ctx.Msg.ChannelID,
+								OriginUser:              getUserIdentifier(*ctx.Msg.Author),
+								TargetCommandingMessage: ctx.Msg,
+								TargetChannelID:         channel,
+								TargetBefore:            beforeID,
+								TargetSince:             sinceID,
+								Updated:                 now,
+								Added:                   now,
+							})
+							if !queued { // ALREADY RUNNING OR WAITING
 								log.Println(lg("Command", "History", color.CyanString,
 									"%s tried using history command but history is already running for %s...",
 									getUserIdentifier(*ctx.Msg.Author), channel))
@@ -511,25 +506,14 @@ func handleCommands() *exrouter.Route {
 					}
 					if shouldWipeDB {
 						if all {
-							myDB.Close()
-							time.Sleep(1 * time.Second)
-							if _, err := os.Stat(pathDatabaseBase); err == nil {
-								err = os.RemoveAll(pathDatabaseBase)
-								if err != nil {
-									log.Println(lg("Command", "History", color.HiRedString,
-										"Encountered error deleting database folder:\t%s", err))
-								} else {
-									log.Println(lg("Command", "History", color.HiGreenString,
-										"Deleted database."))
-								}
-								time.Sleep(1 * time.Second)
-								mainWg.Add(1)
-								go openDatabase()
-								break
-							} else {
+							if err := resetDownloadDatabase(); err != nil {
 								log.Println(lg("Command", "History", color.HiRedString,
-									"Database folder inaccessible:\t%s", err))
+									"Could not reset database safely:\t%s", err))
+							} else {
+								log.Println(lg("Command", "History", color.HiGreenString,
+									"Deleted and reopened database."))
 							}
+							break
 						} else {
 							dbDeleteByChannelID(channel)
 						}
@@ -551,7 +535,7 @@ func handleCommands() *exrouter.Route {
 									"Cache folder inaccessible:\t%s", err))
 							}
 						} else {
-							fp := pathCacheHistory + string(os.PathSeparator) + channel + ".json"
+							fp := historyCacheFilePath(channel)
 							if _, err := os.Stat(fp); err == nil {
 								err = os.RemoveAll(fp)
 								if err != nil {
@@ -570,13 +554,10 @@ func handleCommands() *exrouter.Route {
 				}
 				//#endregion
 			}
-			if shouldWipeDB {
-				cachedDownloadID = dbDownloadCount()
-			}
 		}
 	}).Cat("Admin").Alias("catalog", "cache").Desc("Catalogs history for this channel")
 
-	go router.On("exit", func(ctx *exrouter.Context) {
+	router.On("exit", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
 			if isBotAdmin(ctx.Msg) {
 				if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
@@ -590,7 +571,7 @@ func handleCommands() *exrouter.Route {
 				log.Println(lg("Command", "Exit", color.HiCyanString,
 					"%s (bot admin) requested exit, goodbye...",
 					getUserIdentifier(*ctx.Msg.Author)))
-				properExit()
+				requestShutdown()
 			} else {
 				if !hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 					log.Println(lg("Command", "Exit", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
@@ -609,7 +590,7 @@ func handleCommands() *exrouter.Route {
 	//#endregion
 
 	// Handler for Command Router
-	go bot.AddHandler(func(_ *discordgo.Session, m *discordgo.MessageCreate) {
+	bot.AddHandler(func(_ *discordgo.Session, m *discordgo.MessageCreate) {
 
 		// Override Prefix per-Source
 		prefix := config.CommandPrefix
@@ -628,7 +609,7 @@ func handleCommands() *exrouter.Route {
 		}
 
 		//NOTE: This setup makes it case-insensitive but message content will be lowercase, currently case sensitivity is not necessary.
-		router.FindAndExecute(bot, strings.ToLower(prefix), bot.State.User.ID, messageToLower(m.Message))
+		router.FindAndExecute(bot, strings.ToLower(prefix), discordUserID(), messageToLower(m.Message))
 	})
 
 	return router

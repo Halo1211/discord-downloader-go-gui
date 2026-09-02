@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -14,35 +15,102 @@ import (
 
 //#region Events
 
-var lastMessageID string
+var messageEvents = newMessageEventDeduper()
+
+var sourceLogMu sync.Mutex
+
+func appendSourceLogLine(path, line string, filterDuplicates, enabled bool) (bool, error) {
+	if !enabled {
+		return false, nil
+	}
+	sourceLogMu.Lock()
+	defer sourceLogMu.Unlock()
+	if filterDuplicates {
+		if contents, err := os.ReadFile(path); err == nil && strings.Contains(string(contents), line) {
+			return false, nil
+		}
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return false, err
+	}
+	_, writeErr := file.WriteString(line)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return false, writeErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return true, nil
+}
+
+type messageEventDeduper struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+func newMessageEventDeduper() *messageEventDeduper {
+	return &messageEventDeduper{seen: make(map[string]time.Time)}
+}
+
+func (d *messageEventDeduper) first(event, messageID string) bool {
+	if messageID == "" {
+		return true
+	}
+	now := time.Now()
+	key := event + "\x00" + messageID
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for seenKey, seenAt := range d.seen {
+		if now.Sub(seenAt) > 2*time.Minute {
+			delete(d.seen, seenKey)
+		}
+	}
+	if _, exists := d.seen[key]; exists {
+		return false
+	}
+	d.seen[key] = now
+	return true
+}
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if lastMessageID != m.ID {
+	if m == nil {
+		return
+	}
+	if messageEvents.first("create", m.ID) {
 		handleMessage(m.Message, nil, false, false)
 	}
-	lastMessageID = m.ID
 }
 
 func messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
-	if lastMessageID != m.ID {
+	if m == nil {
+		return
+	}
+	if messageEvents.first("update", m.ID) {
 		if m.EditedTimestamp != nil {
 			handleMessage(m.Message, nil, true, false)
 		}
 	}
-	lastMessageID = m.ID
 }
 
 func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, history bool) []downloadedItem {
+	if m == nil {
+		return nil
+	}
+	if m.Author == nil {
+		m.Author = &discordgo.User{}
+	}
 	shouldBail := false //TODO: this is messy, overlapped purpose with shouldAbort used for filters down below in this func.
 	shouldBailReason := ""
 	// Ignore own messages unless told not to
-	if m.Author.ID == botUser.ID && !config.ScanOwnMessages {
+	if ownUserID := discordUserID(); ownUserID != "" && m.Author.ID == ownUserID && !config.ScanOwnMessages {
 		shouldBail = true
 		shouldBailReason = "config.ScanOwnMessages"
 	}
 
 	if !history && !edited {
-		timeLastMessage = time.Now()
+		setLastMessage(time.Now())
 	}
 
 	// Admin Channel
@@ -118,7 +186,7 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 		if sourceConfig.LogMessages != nil {
 			if sourceConfig.LogMessages.Destination != "" {
 				encounteredErrors := false
-				savePath := sourceConfig.LogMessages.Destination + string(os.PathSeparator)
+				savePath := filepath.Clean(sourceConfig.LogMessages.Destination)
 
 				// Subfolder Division - Format Subfolders
 				if sourceConfig.LogMessages.Subfolders != nil {
@@ -139,27 +207,25 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 								// Scrub subfolder
 								newSubfolder2 = clearSourceLogField(newSubfolder2, *sourceConfig.LogMessages)
 
-								subfolders = append(subfolders, newSubfolder2)
+								subfolders = append(subfolders, safePathComponent(newSubfolder2))
 							}
 							break
 						} else {
-							subfolders = append(subfolders, newSubfolder)
+							subfolders = append(subfolders, safePathComponent(newSubfolder))
 						}
 					}
 
-					// Subfolder Dividion - Handle Formatted Subfolders
-					subpath := ""
-					for _, subfolder := range subfolders {
-						subpath = subpath + subfolder + string(os.PathSeparator)
-						// Create folder
-						if err := os.MkdirAll(filepath.Clean(savePath+subpath), 0755); err != nil {
-							log.Println(lg("LogMessages", "", color.HiRedString,
-								"Error while creating subfolder \"%s\": %s", savePath+subpath, err))
-							encounteredErrors = true
-						}
+					// Subfolder Division - Handle Formatted Subfolders
+					var pathErr error
+					savePath, pathErr = safePathUnderBase(savePath, subfolders...)
+					if pathErr != nil {
+						log.Println(lg("LogMessages", "", color.HiRedString, "Invalid log subfolder path: %s", pathErr))
+						encounteredErrors = true
+					} else if err := os.MkdirAll(savePath, 0755); err != nil {
+						log.Println(lg("LogMessages", "", color.HiRedString,
+							"Error while creating subfolder \"%s\": %s", savePath, err))
+						encounteredErrors = true
 					}
-					// Format Path
-					savePath = filepath.Clean(savePath + string(os.PathSeparator) + subpath) // overwrite with new destination path
 				}
 
 				if !encounteredErrors {
@@ -180,10 +246,14 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 						}
 
 						// Scrub filename
-						filename = clearSourceLogField(filename, *sourceConfig.LogMessages)
+						filename = safePathComponent(clearSourceLogField(filename, *sourceConfig.LogMessages))
 
 						// Build path
-						logPath := filepath.Clean(savePath + string(os.PathSeparator) + filename)
+						logPath, pathErr := safePathUnderBase(savePath, filename)
+						if pathErr != nil {
+							log.Println(lg("LogMessages", "", color.HiRedString, "Invalid log filename: %s", pathErr))
+							return nil
+						}
 
 						// Prepend
 						prefix := ""
@@ -219,33 +289,9 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 						}
 						newLine += "\n" + prefix + lineContent + suffix
 
-						// Read
-						currentLog := ""
-						if logfile, err := os.ReadFile(logPath); err == nil {
-							currentLog = string(logfile)
-						}
-						canLog := true
-						// Filter Duplicates
-						if sourceConfig.LogMessages.FilterDuplicates != nil {
-							if *sourceConfig.LogMessages.FilterDuplicates {
-								if strings.Contains(currentLog, newLine) {
-									canLog = false
-								}
-							}
-						}
-
-						if canLog {
-							// Writer
-							f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0600)
-							if err != nil {
-								log.Println(lg("LogMessages", "", color.RedString, "[sourceConfig.LogMessages] Failed to open log file:\t%s", err))
-								f.Close()
-							}
-							defer f.Close()
-
-							if _, err = f.WriteString(newLine); err != nil {
-								log.Println(lg("Message", "", color.RedString, "[sourceConfig.LogMessages] Failed to append file:\t%s", err))
-							}
+						filterDuplicates := sourceConfig.LogMessages.FilterDuplicates != nil && *sourceConfig.LogMessages.FilterDuplicates
+						if _, err := appendSourceLogLine(logPath, newLine, filterDuplicates, true); err != nil {
+							log.Println(lg("LogMessages", "", color.RedString, "[sourceConfig.LogMessages] Failed to append log file:\t%s", err))
 						}
 					}
 				}
@@ -380,7 +426,9 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 			if config.Debug {
 				log.Println(lg("Debug", "Message", color.YellowString, "Delaying for %d milliseconds...", delay))
 			}
-			time.Sleep(time.Duration(delay) * time.Millisecond)
+			if waitForRuntimeStop(safeConfiguredDuration(delay, time.Millisecond)) {
+				return nil
+			}
 		}
 
 		// Process Collected Links
@@ -396,34 +444,7 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				continue
 			}
 			// Filter Checks
-			shouldAbort := false
-			if sourceConfig.Filters.BlockedLinkContent != nil {
-				for _, phrase := range *sourceConfig.Filters.BlockedLinkContent {
-					if strings.Contains(file.Link, phrase) && phrase != "" {
-						shouldAbort = true
-						if config.Debug {
-							log.Println(lg("Debug", "Message", color.YellowString,
-								"%s blockedLinkContent found \"%s\" in link, planning to abort...",
-								color.HiMagentaString("(FILTER)"), phrase))
-						}
-						break
-					}
-				}
-			}
-			if sourceConfig.Filters.AllowedLinkContent != nil {
-				for _, phrase := range *sourceConfig.Filters.AllowedLinkContent {
-					if strings.Contains(file.Link, phrase) && phrase != "" {
-						shouldAbort = false
-						if config.Debug {
-							log.Println(lg("Debug", "Message", color.YellowString,
-								"%s allowedLinkContent found \"%s\" in link, planning to process...",
-								color.HiMagentaString("(FILTER)"), phrase))
-						}
-						break
-					}
-				}
-			}
-			if shouldAbort {
+			if !downloadLinkContentAllowed(file.Link, sourceConfig.Filters) {
 				if config.Debug {
 					log.Println(lg("Debug", "Message", color.YellowString,
 						"%s Filter decided to ignore link...",
@@ -433,10 +454,10 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 			}
 			// Output
 			if config.Debug && (!history || config.MessageOutputHistory) {
-				log.Println(lg("Debug", "Message", color.HiCyanString, "FOUND FILE: "+file.Link+fmt.Sprintf(" \t<%s>", m.ID)))
+				log.Println(lg("Debug", "Message", color.HiCyanString, "%s", "FOUND FILE: "+file.Link+fmt.Sprintf(" \t<%s>", m.ID)))
 			}
 			// Handle Download
-			status, filesize := downloadRequestStruct{
+			request := downloadRequestStruct{
 				InputURL:     file.Link,
 				Filename:     file.Filename,
 				Path:         sourceConfig.Destination,
@@ -447,7 +468,14 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				EmojiCmd:     false,
 				StartTime:    time.Now(),
 				AttachmentID: file.AttachmentID,
-			}.handleDownload()
+			}
+			if !history {
+				if !queueRealTimeDownload(request) {
+					log.Println(lg("Download", "Queue", color.HiRedString, "Download queue is unavailable; skipping %s", file.Link))
+				}
+				continue
+			}
+			status, filesize := runHistoryDownload(request)
 			// Await Status
 			if status.Status == downloadSuccess {
 				domain, _ := getDomain(file.Link)

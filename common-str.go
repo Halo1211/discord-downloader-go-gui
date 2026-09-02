@@ -3,11 +3,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
 )
@@ -50,29 +53,29 @@ func formatNumber(n int64) string {
 }
 
 func formatNumberShort(x int64) string {
-	var numberSeparator string = ","
-	if config.EuropeanNumbers {
-		numberSeparator = "."
-	}
-	var decimalSeparator string = "."
+	decimalSeparator := "."
 	if config.EuropeanNumbers {
 		decimalSeparator = ","
 	}
 
-	if x > 1000 {
-		formattedNumber := formatNumber(x)
-		splitSlice := strings.Split(formattedNumber, numberSeparator)
-		suffixes := [4]string{"k", "m", "b", "t"}
-		partCount := len(splitSlice) - 1
-		var output string
-		if splitSlice[1][:1] != "0" {
-			output = fmt.Sprintf("%s%s%s%s", splitSlice[0], decimalSeparator, splitSlice[1][:1], suffixes[partCount-1])
-		} else {
-			output = fmt.Sprintf("%s%s", splitSlice[0], suffixes[partCount-1])
-		}
-		return output
+	value := float64(x)
+	if math.Abs(value) <= 1000 {
+		return fmt.Sprint(x)
 	}
-	return fmt.Sprint(x)
+	suffixes := []string{"k", "m", "b", "t", "q", "qi"}
+	suffixIndex := -1
+	for math.Abs(value) >= 1000 && suffixIndex < len(suffixes)-1 {
+		value /= 1000
+		suffixIndex++
+	}
+	// Preserve the old compact style: at most one decimal, truncated rather
+	// than rounded so the displayed tally never exceeds the actual value.
+	value = math.Trunc(value*10) / 10
+	formatted := strings.TrimSuffix(fmt.Sprintf("%.1f", value), ".0")
+	if decimalSeparator != "." {
+		formatted = strings.Replace(formatted, ".", decimalSeparator, 1)
+	}
+	return formatted + suffixes[suffixIndex]
 }
 
 func pluralS(num int) string {
@@ -106,8 +109,15 @@ func stripSymbols(i string) string {
 }
 
 func isNumeric(s string) bool {
-	_, err := strconv.ParseFloat(s, 64)
-	return err == nil
+	if s == "" {
+		return false
+	}
+	for _, character := range s {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func clearPathIllegalChars(p string) string {
@@ -115,7 +125,43 @@ func clearPathIllegalChars(p string) string {
 	for _, key := range pathBlacklist {
 		r = strings.ReplaceAll(r, key, "")
 	}
-	return r
+	return strings.Map(func(character rune) rune {
+		if character < 32 || character == 127 {
+			return -1
+		}
+		return character
+	}, r)
+}
+
+func safePathComponent(value string) string {
+	value = strings.TrimRight(strings.TrimSpace(clearPathIllegalChars(value)), ". ")
+	if value == "" || value == "." || value == ".." {
+		return "_"
+	}
+	base := value
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	upperBase := strings.ToUpper(base)
+	reserved := upperBase == "CON" || upperBase == "PRN" || upperBase == "AUX" || upperBase == "NUL"
+	if len(upperBase) == 4 && (strings.HasPrefix(upperBase, "COM") || strings.HasPrefix(upperBase, "LPT")) && upperBase[3] >= '1' && upperBase[3] <= '9' {
+		reserved = true
+	}
+	if reserved {
+		value = "_" + value
+	}
+	return value
+}
+
+func safePathUnderBase(basePath string, components ...string) (string, error) {
+	target := filepath.Clean(basePath)
+	for _, component := range components {
+		target = filepath.Join(target, safePathComponent(component))
+	}
+	if !pathIsWithinBase(basePath, target) {
+		return "", fmt.Errorf("path escapes base directory %q", basePath)
+	}
+	return target, nil
 }
 
 func clearDiacritics(p string) string {
@@ -142,31 +188,7 @@ func clearDoubleSpaces(p string) string {
 }
 
 func clearPaddedSymbols(p string) string { // currently just spaces
-	ret := p
-	for {
-		if len(ret) == 0 {
-			break
-		}
-		if ret[0] != ' ' {
-			break
-		}
-		ret = ret[1:]
-	}
-	for {
-		if len(ret) == 0 {
-			break
-		}
-		size := len(ret)
-		if ret[size-1] != ' ' {
-			break
-		}
-		if (size - 1) <= 0 {
-			break
-		} else {
-			ret = ret[:size-1]
-		}
-	}
-	return ret
+	return strings.Trim(p, " ")
 }
 
 func clearSourceField(p string, cfg configurationSource) string {
@@ -226,23 +248,73 @@ func clearSourceLogField(p string, cfg configurationSourceLog) string {
 }
 
 func filenameFromURL(inputURL string) string {
-	base := path.Base(inputURL)
-	parts := strings.Split(base, "?")
-	return path.Clean(parts[0])
-}
-
-func filepathExtension(filepath string) string {
-	if strings.Contains(filepath, "?") {
-		filepath = strings.Split(filepath, "?")[0]
+	// Parse the URL path instead of treating the entire URL as a filesystem
+	// path. Queries and fragments are not part of the server-side filename,
+	// and URL paths may contain escaped characters such as spaces.
+	if parsedURL, err := url.Parse(inputURL); err == nil && parsedURL.Path != "" {
+		if base := path.Base(parsedURL.Path); base != "." && base != "/" {
+			return base
+		}
 	}
-	filepath = path.Ext(filepath)
-	return filepath
+	// Preserve the historical best-effort result for malformed or path-less
+	// input while still excluding URL metadata from the filename.
+	withoutFragment := strings.SplitN(inputURL, "#", 2)[0]
+	withoutQuery := strings.SplitN(withoutFragment, "?", 2)[0]
+	return path.Clean(path.Base(withoutQuery))
 }
 
-func getDomain(URL string) (string, error) {
-	parsedURL, err := url.Parse(URL)
+// limitFilenameBytes keeps a filename within common filesystem component
+// limits without splitting a multi-byte UTF-8 character. The extension is
+// retained whenever it fits so type detection and duplicate naming still work.
+func limitFilenameBytes(filename string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(filename) <= maximum {
+		return filename
+	}
+	truncate := func(value string, limit int) string {
+		if limit <= 0 {
+			return ""
+		}
+		if len(value) <= limit {
+			return value
+		}
+		for limit > 0 && !utf8.RuneStart(value[limit]) {
+			limit--
+		}
+		return value[:limit]
+	}
+
+	extension := filepath.Ext(filename)
+	if extension == "" || len(extension) >= maximum {
+		return truncate(filename, maximum)
+	}
+	stem := strings.TrimSuffix(filename, extension)
+	return truncate(stem, maximum-len(extension)) + extension
+}
+
+func filenameWithSuffix(filename string, suffix string, maximum int) string {
+	extension := filepath.Ext(filename)
+	stem := strings.TrimSuffix(filename, extension)
+	remaining := maximum - len(extension)
+	if remaining <= 0 {
+		return limitFilenameBytes(extension, maximum)
+	}
+	if len(suffix) > remaining {
+		suffix = limitFilenameBytes(suffix, remaining)
+		return suffix + extension
+	}
+	return limitFilenameBytes(stem, remaining-len(suffix)) + suffix + extension
+}
+
+func getDomain(inputURL string) (string, error) {
+	parsedURL, err := url.ParseRequestURI(inputURL)
 	if err != nil {
-		return parsedURL.Hostname(), nil
+		return "UNKNOWN", err
 	}
-	return "UNKNOWN", err
+	if parsedURL.Hostname() == "" {
+		return "UNKNOWN", fmt.Errorf("URL has no hostname: %q", inputURL)
+	}
+	return parsedURL.Hostname(), nil
 }

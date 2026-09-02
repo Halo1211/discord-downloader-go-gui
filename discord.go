@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -17,6 +18,33 @@ import (
 	"github.com/fatih/color"
 	"github.com/teris-io/shortid"
 )
+
+// configureDiscordAPI upgrades every eagerly-computed DiscordGo REST root as
+// well as the Gateway query version. DiscordGo intentionally exposes these
+// variables for endpoint overrides, but changing APIVersion alone would leave
+// the derived strings pointing at the package default.
+func configureDiscordAPI() {
+	discordgo.APIVersion = "10"
+	discordgo.EndpointAPI = discordgo.EndpointDiscord + "api/v10/"
+	discordgo.EndpointGuilds = discordgo.EndpointAPI + "guilds/"
+	discordgo.EndpointChannels = discordgo.EndpointAPI + "channels/"
+	discordgo.EndpointUsers = discordgo.EndpointAPI + "users/"
+	discordgo.EndpointGateway = discordgo.EndpointAPI + "gateway"
+	discordgo.EndpointGatewayBot = discordgo.EndpointGateway + "/bot"
+	discordgo.EndpointWebhooks = discordgo.EndpointAPI + "webhooks/"
+	discordgo.EndpointStickers = discordgo.EndpointAPI + "stickers/"
+	discordgo.EndpointStageInstances = discordgo.EndpointAPI + "stage-instances"
+	discordgo.EndpointSKUs = discordgo.EndpointAPI + "skus"
+	discordgo.EndpointVoice = discordgo.EndpointAPI + "voice/"
+	discordgo.EndpointVoiceRegions = discordgo.EndpointVoice + "regions"
+	discordgo.EndpointNitroStickersPacks = discordgo.EndpointAPI + "sticker-packs"
+	discordgo.EndpointGuildCreate = discordgo.EndpointAPI + "guilds"
+	discordgo.EndpointApplications = discordgo.EndpointAPI + "applications"
+	discordgo.EndpointOAuth2 = discordgo.EndpointAPI + "oauth2/"
+	discordgo.EndpointOAuth2Applications = discordgo.EndpointOAuth2 + "applications"
+	discordgo.EndpointOauth2 = discordgo.EndpointOAuth2
+	discordgo.EndpointOauth2Applications = discordgo.EndpointOAuth2Applications
+}
 
 const (
 	fmtBotSendPerm = "Bot does not have permission to send messages in %s"
@@ -188,7 +216,7 @@ func fixMessage(m *discordgo.Message) *discordgo.Message {
 							m.GuildID = serverID
 						}
 						// Parse commands
-						botCommands.FindAndExecute(bot, strings.ToLower(config.CommandPrefix), bot.State.User.ID, messageToLower(m))
+						botCommands.FindAndExecute(bot, strings.ToLower(config.CommandPrefix), discordUserID(), messageToLower(m))
 
 						break
 					}
@@ -265,8 +293,17 @@ func channelDisplay(channelID string) (sourceName string, sourceChannelName stri
 func dataKeys(input string) string {
 	//TODO: Case-insensitive key replacement. -- If no streamlined way to do it, convert to lower to find substring location but replace normally
 	if strings.Contains(input, "{{") && strings.Contains(input, "}}") {
-		countInt := int64(dbDownloadCount()) + *config.InflateDownloadCount
+		inflateCount := int64(0)
+		if config.InflateDownloadCount != nil {
+			inflateCount = *config.InflateDownloadCount
+		}
+		countInt := int64(dbDownloadCount()) + inflateCount
 		timeNow := time.Now()
+		lastUpdated, _, _ := runtimeTelemetrySnapshot()
+		botUsername := ""
+		if user := currentDiscordUser(); user != nil {
+			botUsername = user.Username
+		}
 		keys := [][]string{
 			{"{{dgVersion}}",
 				discordgo.VERSION},
@@ -275,7 +312,7 @@ func dataKeys(input string) string {
 			{"{{apiVersion}}",
 				discordgo.APIVersion},
 			{"{{botUsername}}",
-				clearPathIllegalChars(botUser.Username)},
+				clearPathIllegalChars(botUsername)},
 			{"{{countNoCommas}}",
 				fmt.Sprint(countInt)},
 			{"{{count}}",
@@ -283,7 +320,7 @@ func dataKeys(input string) string {
 			{"{{countShort}}",
 				formatNumberShort(countInt)},
 			{"{{numServers}}",
-				fmt.Sprint(len(bot.State.Guilds))},
+				fmt.Sprint(discordGuildCount())},
 			{"{{numBoundChannels}}",
 				fmt.Sprint(getBoundChannelsCount())},
 			{"{{numBoundCategories}}",
@@ -298,21 +335,21 @@ func dataKeys(input string) string {
 				fmt.Sprint(len(config.Admins))},
 			//TODO: redo time stuff
 			{"{{timeSavedShort}}",
-				timeLastUpdated.Format("3:04pm")},
+				lastUpdated.Format("3:04pm")},
 			{"{{timeSavedShortTZ}}",
-				timeLastUpdated.Format("3:04pm MST")},
+				lastUpdated.Format("3:04pm MST")},
 			{"{{timeSavedMid}}",
-				timeLastUpdated.Format("3:04pm MST 1/2/2006")},
+				lastUpdated.Format("3:04pm MST 1/2/2006")},
 			{"{{timeSavedLong}}",
-				timeLastUpdated.Format("3:04:05pm MST - January 2, 2006")},
+				lastUpdated.Format("3:04:05pm MST - January 2, 2006")},
 			{"{{timeSavedShort24}}",
-				timeLastUpdated.Format("15:04")},
+				lastUpdated.Format("15:04")},
 			{"{{timeSavedShortTZ24}}",
-				timeLastUpdated.Format("15:04 MST")},
+				lastUpdated.Format("15:04 MST")},
 			{"{{timeSavedMid24}}",
-				timeLastUpdated.Format("15:04 MST 2/1/2006")},
+				lastUpdated.Format("15:04 MST 2/1/2006")},
 			{"{{timeSavedLong24}}",
-				timeLastUpdated.Format("15:04:05 MST - 2 January, 2006")},
+				lastUpdated.Format("15:04:05 MST - 2 January, 2006")},
 			{"{{timeNowShort}}",
 				timeNow.Format("3:04pm")},
 			{"{{timeNowShortTZ}}",
@@ -434,6 +471,10 @@ func dataKeysDownload(input string, sourceConfig configurationSource, download d
 			fmt_url = clearPathIllegalChars(download.InputURL)
 		}
 
+		botUsername := ""
+		if user := currentDiscordUser(); user != nil {
+			botUsername = user.Username
+		}
 		keys := [][]string{
 			{"{{date}}", messageTime.Format(filenameDateFormat)},
 			{"{{file}}", download.Filename},
@@ -468,7 +509,7 @@ func dataKeysDownload(input string, sourceConfig configurationSource, download d
 			{"{{nanoID}}", nanoID},
 			{"{{shortID}}", shortID},
 			{"{{botUsername}}",
-				clearPathIllegalChars(botUser.Username)},
+				clearPathIllegalChars(botUsername)},
 		}
 		for _, key := range keys {
 			if strings.Contains(ret, key[0]) {
@@ -482,6 +523,10 @@ func dataKeysDownload(input string, sourceConfig configurationSource, download d
 func dataKeys_DiscordMessage(input string, m *discordgo.Message) string {
 	ret := input
 	if strings.Contains(ret, "{{") && strings.Contains(ret, "}}") && m != nil {
+		botUsername := ""
+		if user := currentDiscordUser(); user != nil {
+			botUsername = user.Username
+		}
 		// Basic message data
 		keys := [][]string{
 			{"{{year}}",
@@ -503,7 +548,7 @@ func dataKeys_DiscordMessage(input string, m *discordgo.Message) string {
 			{"{{message}}", clearPathIllegalChars(m.Content)},
 			{"{{channelID}}", m.ChannelID},
 			{"{{botUsername}}",
-				clearPathIllegalChars(botUser.Username)},
+				clearPathIllegalChars(botUsername)},
 		}
 		// Author data if present
 		if m.Author != nil {
@@ -525,22 +570,25 @@ func dataKeys_DiscordMessage(input string, m *discordgo.Message) string {
 			}...)
 		}
 		// Lookup channel
-		var ch *discordgo.Channel = nil
-		ch, err = bot.Channel(m.ChannelID)
-		if err != nil || ch == nil {
-			ch, _ = bot.State.Channel(m.ChannelID)
+		var ch *discordgo.Channel
+		session := currentDiscordSession()
+		if session != nil {
+			ch, _ = session.Channel(m.ChannelID)
+			if ch == nil && session.State != nil {
+				ch, _ = session.State.Channel(m.ChannelID)
+			}
 		}
-		if ch != nil {
+		if ch != nil && session != nil {
 			keys = append(keys, [][]string{
 				{"{{channelName}}", clearPathIllegalChars(ch.Name)},
 				{"{{channelTopic}}", clearPathIllegalChars(ch.Topic)},
 				{"{{serverID}}", ch.GuildID},
 			}...)
 			// Lookup server
-			var srv *discordgo.Guild = nil
-			srv, err = bot.Guild(ch.GuildID)
-			if err != nil || srv == nil {
-				srv, _ = bot.State.Guild(ch.GuildID)
+			var srv *discordgo.Guild
+			srv, _ = session.Guild(ch.GuildID)
+			if srv == nil && session.State != nil {
+				srv, _ = session.State.Guild(ch.GuildID)
 			}
 			if srv != nil {
 				keys = append(keys, [][]string{
@@ -549,10 +597,10 @@ func dataKeys_DiscordMessage(input string, m *discordgo.Message) string {
 			}
 			// Lookup parent channel
 			if ch.ParentID != "" {
-				var cat *discordgo.Channel = nil
-				cat, err = bot.Channel(ch.ParentID)
-				if err != nil || cat == nil {
-					cat, _ = bot.State.Channel(ch.ParentID)
+				var cat *discordgo.Channel
+				cat, _ = session.Channel(ch.ParentID)
+				if cat == nil && session.State != nil {
+					cat, _ = session.State.Channel(ch.ParentID)
 				}
 				if cat != nil {
 					if cat.Type == discordgo.ChannelTypeGuildCategory {
@@ -572,11 +620,14 @@ func dataKeys_DiscordMessage(input string, m *discordgo.Message) string {
 						}...)
 						// Parent Category
 						if cat.ParentID != "" {
-							cat2, err := bot.State.Channel(cat.ParentID)
-							if err != nil {
-								cat2, err = bot.Channel(cat.ParentID)
+							var cat2 *discordgo.Channel
+							if session.State != nil {
+								cat2, _ = session.State.Channel(cat.ParentID)
 							}
-							if err == nil {
+							if cat2 == nil {
+								cat2, _ = session.Channel(cat.ParentID)
+							}
+							if cat2 != nil {
 								keys = append(keys, [][]string{
 									{"{{categoryID}}", cat2.ID},
 									{"{{categoryName}}", clearPathIllegalChars(cat2.Name)},
@@ -630,13 +681,21 @@ func dataKeys_DownloadStatus(input string, status downloadStatusStruct, download
 }
 
 func updateDiscordPresence() {
-	if bot != nil && botReady && config.PresenceEnabled {
+	if !botReady.Load() {
+		return
+	}
+	session := currentDiscordSession()
+	if session == nil {
+		return
+	}
+	updated, _, _ := runtimeTelemetrySnapshot()
+	if config.PresenceEnabled {
 		// Vars
 		countInt := int64(dbDownloadCount()) + *config.InflateDownloadCount
 		count := formatNumber(countInt)
 		countShort := formatNumberShort(countInt)
-		timeShort := timeLastUpdated.Format("3:04pm")
-		timeLong := timeLastUpdated.Format("3:04:05pm MST - January 2, 2006")
+		timeShort := updated.Format("3:04pm")
+		timeLong := updated.Format("3:04:05pm MST - January 2, 2006")
 
 		// Defaults
 		status := fmt.Sprintf("%s - %s files", timeShort, countShort)
@@ -666,17 +725,17 @@ func updateDiscordPresence() {
 		}
 
 		// Update
-		bot.UpdateStatusComplex(discordgo.UpdateStatusData{
-			Game: &discordgo.Game{
+		session.UpdateStatusComplex(discordgo.UpdateStatusData{
+			Activities: []*discordgo.Activity{{
 				Name:    status,
 				Type:    config.PresenceType,
 				Details: statusDetails, // Only visible if real user
 				State:   statusState,
-			},
+			}},
 			Status: config.PresenceStatus,
 		})
 	} else if config.PresenceStatus != string(discordgo.StatusOnline) {
-		bot.UpdateStatusComplex(discordgo.UpdateStatusData{
+		session.UpdateStatusComplex(discordgo.UpdateStatusData{
 			Status: config.PresenceStatus,
 		})
 	}
@@ -844,7 +903,8 @@ func sendStatusMessage(status sendStatusType) {
 				if status == sendStatusReconnect {
 					emoji = "🟧"
 				}
-				message += fmt.Sprintf("%s %s and connected to %d server%s...\n", projectLabel, sendStatusLabel(status), len(bot.State.Guilds), pluralS(len(bot.State.Guilds)))
+				serverCount := discordGuildCount()
+				message += fmt.Sprintf("%s %s and connected to %d server%s...\n", projectLabel, sendStatusLabel(status), serverCount, pluralS(serverCount))
 				message += fmt.Sprintf("\n• Uptime is %s", uptime())
 				message += fmt.Sprintf("\n• %s total downloads", formatNumber(int64(dbDownloadCount())))
 				message += fmt.Sprintf("\n• Bound to %d channel%s, %d categories, %d server%s, %d user%s",
@@ -929,13 +989,24 @@ func sendErrorMessage(err string) {
 //#region Permissions
 
 func hasPerms(channelID string, permission int64) bool {
+	if channelID == "" {
+		return false
+	}
+	session := currentDiscordSession()
+	if session == nil {
+		return false
+	}
 	if selfbot {
 		return true
 	}
 
-	sourceChannel, err := bot.State.Channel(channelID)
-	if err != nil {
-		sourceChannel, err = bot.Channel(channelID)
+	var sourceChannel *discordgo.Channel
+	var err error
+	if session.State != nil {
+		sourceChannel, err = session.State.Channel(channelID)
+	}
+	if sourceChannel == nil {
+		sourceChannel, err = session.Channel(channelID)
 	}
 	if sourceChannel != nil && err == nil {
 		switch sourceChannel.Type {
@@ -944,7 +1015,11 @@ func hasPerms(channelID string, permission int64) bool {
 		case discordgo.ChannelTypeGroupDM:
 			return true
 		default:
-			perms, err := bot.UserChannelPermissions(botUser.ID, channelID)
+			userID := discordUserID()
+			if userID == "" {
+				return false
+			}
+			perms, err := session.UserChannelPermissions(userID, channelID)
 			if err == nil {
 				return perms&permission == permission
 			}
@@ -952,7 +1027,7 @@ func hasPerms(channelID string, permission int64) bool {
 				"Failed to check permissions (%d) for %s:\t%s", permission, channelID, err))
 		}
 	}
-	return true
+	return false
 }
 
 //#endregion
@@ -976,38 +1051,58 @@ func downloadDiscordEmojis() {
 	}
 
 	if config.EmojisServers != nil {
+		session := currentDiscordSession()
+		if session == nil {
+			log.Println(lg("Discord", "Emojis", color.HiRedString, "Discord session is unavailable"))
+			return
+		}
 		// Handle destination
 		destination := "emojis"
 		if config.EmojisDestination != nil {
 			destination = *config.EmojisDestination
 		}
-		if err = os.MkdirAll(destination, 0755); err != nil {
+		if err := os.MkdirAll(destination, 0755); err != nil {
 			log.Println(lg("Discord", "Emojis", color.HiRedString, "Error while creating destination folder \"%s\": %s", destination, err))
+			return
 		}
 		// Start
 		log.Println(lg("Discord", "Emojis", color.MagentaString, "Starting emoji downloads..."))
 		for _, serverID := range *config.EmojisServers {
-			emojis, err := bot.GuildEmojis(serverID)
+			if runtimeIsStopping() {
+				return
+			}
+			emojis, err := session.GuildEmojis(serverID)
 			if err != nil {
 				log.Println(lg("Discord", "Emojis", color.HiRedString, "Error fetching emojis from %s... %s", serverID, err))
 			} else {
 				guildName := "UNKNOWN"
-				guild, err := bot.Guild(serverID)
-				if err == nil {
+				guild, err := session.Guild(serverID)
+				if err == nil && guild != nil {
 					guildName = guild.Name
 				}
-				subfolder := destination + string(os.PathSeparator) + clearPathIllegalChars(guildName)
+				subfolder, pathErr := safePathUnderBase(destination, clearPathIllegalChars(guildName))
+				if pathErr != nil {
+					log.Println(lg("Discord", "Emojis", color.HiRedString, "Invalid emoji subfolder: %s", pathErr))
+					continue
+				}
 				if err = os.MkdirAll(subfolder, 0755); err != nil {
 					log.Println(lg("Discord", "Emojis", color.HiRedString, "Error while creating subfolder \"%s\": %s", subfolder, err))
+					continue
 				}
 
 				countDownloaded := 0
 				countSkipped := 0
 				countFailed := 0
 				for _, emoji := range emojis {
+					if runtimeIsStopping() {
+						return
+					}
+					if emoji == nil {
+						continue
+					}
 					url := "https://cdn.discordapp.com/emojis/" + emoji.ID
 
-					status, _ := downloadRequestStruct{
+					status, _ := runHistoryDownload(downloadRequestStruct{
 						InputURL:   url,
 						Filename:   dataKeysEmoji(*emoji, serverID),
 						Path:       subfolder,
@@ -1017,7 +1112,7 @@ func downloadDiscordEmojis() {
 						HistoryCmd: false,
 						EmojiCmd:   true,
 						StartTime:  time.Now(),
-					}.handleDownload()
+					})
 
 					if status.Status == downloadSuccess {
 						countDownloaded++
@@ -1037,7 +1132,7 @@ func downloadDiscordEmojis() {
 				if err == nil {
 					destinationOut = abs
 				}
-				log.Println(lg("Discord", "Emojis", color.HiMagentaString,
+				log.Println(lg("Discord", "Emojis", color.HiMagentaString, "%s",
 					fmt.Sprintf("%d emojis downloaded, %d skipped, %d failed - Destination: %s",
 						countDownloaded, countSkipped, countFailed, destinationOut,
 					)))
@@ -1064,34 +1159,54 @@ func downloadDiscordStickers() {
 	}
 
 	if config.StickersServers != nil {
+		session := currentDiscordSession()
+		if session == nil {
+			log.Println(lg("Discord", "Stickers", color.HiRedString, "Discord session is unavailable"))
+			return
+		}
 		// Handle destination
 		destination := "stickers"
 		if config.StickersDestination != nil {
 			destination = *config.StickersDestination
 		}
-		if err = os.MkdirAll(destination, 0755); err != nil {
+		if err := os.MkdirAll(destination, 0755); err != nil {
 			log.Println(lg("Discord", "Stickers", color.HiRedString, "Error while creating destination folder \"%s\": %s", destination, err))
+			return
 		}
 		log.Println(lg("Discord", "Stickers", color.MagentaString, "Starting sticker downloads..."))
 		for _, serverID := range *config.StickersServers {
+			if runtimeIsStopping() {
+				return
+			}
 			guildName := "UNKNOWN"
-			guild, err := bot.Guild(serverID)
+			guild, err := session.Guild(serverID)
 			if err != nil {
 				log.Println(lg("Discord", "Stickers", color.HiRedString, "Error fetching server %s... %s", serverID, err))
 			} else {
 				guildName = guild.Name
-				subfolder := destination + string(os.PathSeparator) + clearPathIllegalChars(guildName)
+				subfolder, pathErr := safePathUnderBase(destination, clearPathIllegalChars(guildName))
+				if pathErr != nil {
+					log.Println(lg("Discord", "Stickers", color.HiRedString, "Invalid sticker subfolder: %s", pathErr))
+					continue
+				}
 				if err = os.MkdirAll(subfolder, 0755); err != nil {
 					log.Println(lg("Discord", "Emojis", color.HiRedString, "Error while creating subfolder \"%s\": %s", subfolder, err))
+					continue
 				}
 
 				countDownloaded := 0
 				countSkipped := 0
 				countFailed := 0
 				for _, sticker := range guild.Stickers {
+					if runtimeIsStopping() {
+						return
+					}
+					if sticker == nil {
+						continue
+					}
 					url := "https://media.discordapp.net/stickers/" + sticker.ID
 
-					status, _ := downloadRequestStruct{
+					status, _ := runHistoryDownload(downloadRequestStruct{
 						InputURL:   url,
 						Filename:   dataKeysSticker(*sticker),
 						Path:       subfolder,
@@ -1101,7 +1216,7 @@ func downloadDiscordStickers() {
 						HistoryCmd: false,
 						EmojiCmd:   true,
 						StartTime:  time.Now(),
-					}.handleDownload()
+					})
 
 					if status.Status == downloadSuccess {
 						countDownloaded++
@@ -1121,7 +1236,7 @@ func downloadDiscordStickers() {
 				if err == nil {
 					destinationOut = abs
 				}
-				log.Println(lg("Discord", "Stickers", color.HiMagentaString,
+				log.Println(lg("Discord", "Stickers", color.HiMagentaString, "%s",
 					fmt.Sprintf("%d stickers downloaded, %d skipped, %d failed - Destination: %s",
 						countDownloaded, countSkipped, countFailed, destinationOut,
 					)))
@@ -1135,63 +1250,132 @@ func downloadDiscordStickers() {
 
 //#region BOT LOGIN SEQUENCE
 
+func configureDiscordSessionForGateway(session *discordgo.Session) error {
+	if session == nil {
+		return errors.New("discord session was not initialized")
+	}
+	if session.Client == nil || session.State == nil {
+		return errors.New("discord session is missing its HTTP client or state cache")
+	}
+
+	// These options must be installed before Open. Ready and the first gateway
+	// events may arrive during the handshake; changing cache tracking afterwards
+	// can leave the initial state incomplete until a later event repairs it.
+	session.Identify.Intents = discordgo.IntentsGuilds |
+		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildMessageReactions |
+		discordgo.IntentsDirectMessages |
+		discordgo.IntentsDirectMessageReactions |
+		discordgo.IntentsMessageContent
+	session.ShouldReconnectOnError = true
+	session.Client.Timeout = safeConfiguredDuration(config.DiscordTimeout, time.Second)
+	session.StateEnabled = true
+	session.State.MaxMessageCount = 100000
+	session.State.TrackChannels = true
+	session.State.TrackThreads = true
+	session.State.TrackMembers = true
+	session.State.TrackThreadMembers = true
+	return nil
+}
+
+func registerDiscordHandlers(session *discordgo.Session) error {
+	if session == nil {
+		return errors.New("discord session was not initialized")
+	}
+	setDiscordSession(session)
+	botCommands = handleCommands()
+	session.AddHandler(messageCreate)
+	session.AddHandler(messageUpdate)
+	return nil
+}
+
 func botLoadDiscord() {
 	var err error
+	botReady.Store(false)
+	setDiscordUser(nil)
 
 	// Discord Login
-	connectBot := func() {
+	connectBot := func(session *discordgo.Session) error {
+		if err := configureDiscordSessionForGateway(session); err != nil {
+			return err
+		}
+
 		// Connect Bot
-		bot.LogLevel = -1 // to ignore dumb wsapi error
-		err = bot.Open()
-		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "web socket already opened") {
-			log.Println(lg("Discord", "", color.HiRedString, "Discord login failed:\t%s", err))
-			properExit()
+		session.LogLevel = -1 // to ignore noisy websocket errors during login
+		openErr := session.Open()
+		session.LogLevel = config.DiscordLogLevel // reset
+		if openErr != nil && !strings.Contains(strings.ToLower(openErr.Error()), "web socket already opened") {
+			return openErr
 		}
 
-		bot.LogLevel = config.DiscordLogLevel // reset
-		bot.ShouldReconnectOnError = true
-		dur, err := time.ParseDuration(fmt.Sprint(config.DiscordTimeout) + "s")
-		if err != nil {
-			dur, _ = time.ParseDuration("180s")
+		user, userErr := session.User("@me")
+		if userErr != nil {
+			session.State.RLock()
+			user = session.State.User
+			session.State.RUnlock()
 		}
-		bot.Client.Timeout = dur
-
-		bot.StateEnabled = true
-		bot.State.MaxMessageCount = 100000
-		bot.State.TrackChannels = true
-		bot.State.TrackThreads = true
-		bot.State.TrackMembers = true
-		bot.State.TrackThreadMembers = true
-
-		botUser, err = bot.User("@me")
-		if err != nil {
-			botUser = bot.State.User
+		if user == nil {
+			if userErr != nil {
+				return userErr
+			}
+			return fmt.Errorf("Discord returned no current user")
 		}
+		setDiscordUser(user)
+		return nil
 	}
 
 	discord_login_count := 0
 do_discord_login:
 	discord_login_count++
 	if discord_login_count > 1 {
+		if session := currentDiscordSession(); session != nil {
+			_ = session.Close()
+			setDiscordSession(nil)
+		}
+		setDiscordUser(nil)
 		time.Sleep(3 * time.Second)
 	}
 
 	if config.Credentials.Token != "" && config.Credentials.Token != placeholderToken {
-		// Login via Token (Bot or User)
-		log.Println(lg("Discord", "", color.GreenString, "Connecting to Discord via Token..."))
-		// attempt login without Bot prefix
-		bot, err = discordgo.New(config.Credentials.Token)
-		connectBot()
-		if botUser.Bot { // is bot application, reconnect properly
-			//log.Println(lg("Discord", "", color.GreenString, "Reconnecting as bot..."))
-			bot, err = discordgo.New("Bot " + config.Credentials.Token)
+		// Login via token. DiscordGo requires a `Bot ` prefix for bot tokens;
+		// the old code tried the raw token first, which makes valid bot tokens
+		// fail before it ever reached the prefixed retry.
+		log.Println(lg("Discord", "", color.GreenString, "Connecting to Discord via token..."))
+		rawToken := strings.TrimSpace(config.Credentials.Token)
+		botToken := rawToken
+		if !strings.HasPrefix(strings.ToLower(botToken), "bot ") {
+			botToken = "Bot " + botToken
+		}
+		var session *discordgo.Session
+		session, err = discordgo.New(botToken)
+		if err == nil {
+			err = registerDiscordHandlers(session)
+		}
+		if err == nil {
+			err = connectBot(session)
+		}
+		// Keep a compatibility fallback for legacy user tokens, but do not hide
+		// the policy warning below. User-account automation is not supported by
+		// Discord and may stop working at any time.
+		if err != nil && !strings.HasPrefix(strings.ToLower(rawToken), "bot ") {
+			if session != nil {
+				_ = session.Close()
+			}
+			session, err = discordgo.New(rawToken)
+			if err == nil {
+				err = registerDiscordHandlers(session)
+			}
+			if err == nil {
+				err = connectBot(session)
+			}
 		}
 
-	} else if (config.Credentials.Email != "" && config.Credentials.Email != placeholderEmail) &&
+	} else if (config.Credentials.Email != "" && config.Credentials.Email != placeholderEmail) ||
 		(config.Credentials.Password != "" && config.Credentials.Password != placeholderPassword) {
-		// Login via Email+Password (User Only obviously)
-		log.Println(lg("Discord", "", color.GreenString, "Connecting via Login..."))
-		bot, err = discordgo.New(config.Credentials.Email, config.Credentials.Password)
+		// Discord API v10 and current DiscordGo releases intentionally do not
+		// support user-account email/password automation. Keep the fields only so
+		// old configuration files can be migrated without silently losing data.
+		err = fmt.Errorf("email/password Discord login is no longer supported; configure a bot token")
 	} else {
 		if discord_login_count > 5 {
 			log.Println(lg("Discord", "", color.HiRedString, "No valid credentials for Discord..."))
@@ -1209,21 +1393,9 @@ do_discord_login:
 		}
 	}
 
-	connectBot()
-
-	// Fetch Bot's User Info
-	botUser, err = bot.User("@me")
-	if err != nil {
-		botUser = bot.State.User
-		if botUser == nil {
-			if discord_login_count > 5 {
-				log.Println(lg("Discord", "", color.HiRedString, "Error obtaining user details: %s", err))
-				properExit()
-			} else {
-				goto do_discord_login
-			}
-		}
-	} else if botUser == nil {
+	// Fetch Bot's User Info (connectBot already populated it when possible).
+	user := currentDiscordUser()
+	if user == nil {
 		if discord_login_count > 5 {
 			log.Println(lg("Discord", "", color.HiRedString, "No error encountered obtaining user details, but it's empty..."))
 			properExit()
@@ -1231,12 +1403,12 @@ do_discord_login:
 			goto do_discord_login
 		}
 	} else {
-		botReady = true
-		log.Println(lg("Discord", "", color.HiGreenString, "Logged into %s", getUserIdentifier(*botUser)))
-		if botUser.Bot {
+		botReady.Store(true)
+		log.Println(lg("Discord", "", color.HiGreenString, "Logged into %s", getUserIdentifier(*user)))
+		if user.Bot {
 			log.Println(lg("Discord", "Info", color.HiMagentaString, "GENUINE DISCORD BOT APPLICATION"))
 			log.Println(lg("Discord", "Info", color.MagentaString, "~ This is the safest way to use this bot."))
-			log.Println(lg("Discord", "Info", color.MagentaString, "~ INTENTS: Make sure you have all 3 intents enabled for this bot in the Discord Developer Portal."))
+			log.Println(lg("Discord", "Info", color.MagentaString, "~ INTENTS: Enable Message Content Intent in the Discord Developer Portal."))
 			log.Println(lg("Discord", "Info", color.MagentaString, "~ PRESENCE: Details don't work. Only activity and status."))
 			log.Println(lg("Discord", "Info", color.MagentaString, "~ VISIBILITY: You can only see servers you have added the bot to, which requires you to be an admin or have an admin invite the bot."))
 		} else {
@@ -1250,17 +1422,10 @@ do_discord_login:
 			log.Println(lg("Discord", "Info", color.HiMagentaString, "~ VISIBILITY: You can download from any channels/servers this account has access to."))
 		}
 	}
-	if bot.State.User != nil { // is selfbot
-		selfbot = bot.State.User.Email != ""
-	}
-
-	// Event Handlers
-	botCommands = handleCommands()
-	bot.AddHandler(messageCreate)
-	bot.AddHandler(messageUpdate)
+	selfbot = user.Email != "" // is selfbot
 
 	// Start Presence
-	timeLastUpdated = time.Now()
+	setLastUpdated(time.Now())
 	go updateDiscordPresence()
 
 	//(SV) Source Validation
@@ -1303,17 +1468,17 @@ do_discord_login:
 				for _, subchannel := range *adminChannel.ChannelIDs {
 					if validateSource(getChannelErr, subchannel, "admin subchannel", &invalidAdminChannels) {
 						checkChannelPerm(discordgo.PermissionViewChannel, "PermissionViewChannel",
-							subchannel, "admin subchannel", &missingPermsChannels)
+							subchannel, "admin subchannel", &missingPermsAdminChannels)
 						checkChannelPerm(discordgo.PermissionSendMessages, "PermissionSendMessages",
-							subchannel, "admin subchannel", &missingPermsChannels)
+							subchannel, "admin subchannel", &missingPermsAdminChannels)
 					}
 				}
 			} else {
 				if validateSource(getChannelErr, adminChannel.ChannelID, "admin channel", &invalidAdminChannels) {
 					checkChannelPerm(discordgo.PermissionViewChannel, "PermissionViewChannel",
-						adminChannel.ChannelID, "admin channel", &missingPermsChannels)
+						adminChannel.ChannelID, "admin channel", &missingPermsAdminChannels)
 					checkChannelPerm(discordgo.PermissionSendMessages, "PermissionSendMessages",
-						adminChannel.ChannelID, "admin channel", &missingPermsChannels)
+						adminChannel.ChannelID, "admin channel", &missingPermsAdminChannels)
 				}
 			}
 		}
@@ -1322,14 +1487,11 @@ do_discord_login:
 	for _, server := range config.Servers {
 		if server.ServerIDs != nil {
 			for _, subserver := range *server.ServerIDs {
-				if validateSource(getServerErr, subserver, "subserver", &invalidServers) {
-					//TODO: tbd?
-				}
+				validateSource(getServerErr, subserver, "subserver", &invalidServers)
 			}
-		} else {
-			if validateSource(getServerErr, server.ServerID, "server", &invalidServers) {
-				//TODO: tbd?
-			}
+		}
+		if server.ServerID != "" {
+			validateSource(getServerErr, server.ServerID, "server", &invalidServers)
 		}
 	}
 	//(SV) Check "categories" config.Categories
@@ -1338,14 +1500,14 @@ do_discord_login:
 			for _, subcategory := range *category.CategoryIDs {
 				if validateSource(getChannelErr, subcategory, "subcategory", &invalidCategories) {
 					checkChannelPerm(discordgo.PermissionViewChannel, "PermissionViewChannel",
-						subcategory, "subcategory", &missingPermsChannels)
+						subcategory, "subcategory", &missingPermsCategories)
 				}
 			}
 
 		} else {
 			if validateSource(getChannelErr, category.CategoryID, "category", &invalidCategories) {
 				checkChannelPerm(discordgo.PermissionViewChannel, "PermissionViewChannel",
-					category.CategoryID, "category", &missingPermsChannels)
+					category.CategoryID, "category", &missingPermsCategories)
 			}
 		}
 	}

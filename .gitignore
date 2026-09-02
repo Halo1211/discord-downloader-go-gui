@@ -24,3 +24,20 @@
 # Exclude program storage
 **
 !*.go
+!ARCHITECTURE.md
+!README.md
+!LICENSE
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!docs/
+!docs/*.md
+!settings.example.json
+!RELEASE_NOTES.md
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+
+# Local release artifacts. Build outputs and release bundles must stay local.
+release/

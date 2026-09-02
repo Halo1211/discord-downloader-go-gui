@@ -5,12 +5,12 @@ import (
 )
 
 var (
-	projectName     = "discord-downloader-go"
-	projectLabel    = "Discord Downloader GO"
-	projectRepoBase = "get-got/discord-downloader-go"
+	projectName     = "discord-downloader-go-gui"
+	projectLabel    = "Discord Downloader Go GUI"
+	projectRepoBase = "Halo1211/discord-downloader-go-gui"
 	projectRepoURL  = "https://github.com/" + projectRepoBase
 	projectIcon     = "https://cdn.discordapp.com/icons/780985109608005703/9dc25f1b91e6d92664590254e0797fad.webp?size=256"
-	projectVersion  = "2.6.1" // follows Semantic Versioning, (http://semver.org/)
+	projectVersion  = "2.6.2" // follows Semantic Versioning, (http://semver.org/)
 
 	pathCache             = "cache"
 	pathCacheHistory      = pathCache + string(os.PathSeparator) + "history"
@@ -23,6 +23,8 @@ var (
 	pathDatabaseBase      = "database"
 	pathDatabaseBackups   = "backups"
 
-	defaultReact = "✅"
+	defaultReact = builtInDefaultReact
 	limitMsg     = 2000
 )
+
+const builtInDefaultReact = "✅"

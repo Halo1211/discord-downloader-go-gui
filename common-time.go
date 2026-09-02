@@ -7,6 +7,17 @@ import (
 	"github.com/hako/durafmt"
 )
 
+func safeConfiguredDuration(value int, unit time.Duration) time.Duration {
+	if value <= 0 || unit <= 0 {
+		return 0
+	}
+	const maximumDuration = time.Duration(1<<63 - 1)
+	if int64(value) > int64(maximumDuration/unit) {
+		return maximumDuration
+	}
+	return time.Duration(value) * unit
+}
+
 /*const (
 	timeFmtAMPML       = "pm"
 	timeFmtAMPMU       = "PM"

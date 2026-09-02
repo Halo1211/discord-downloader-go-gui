@@ -14,6 +14,8 @@ import (
 	"github.com/hashicorp/go-version"
 )
 
+var jsonHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 func uptime() time.Duration {
 	return time.Since(startTime) //.Truncate(time.Second)
 }
@@ -27,28 +29,36 @@ func properExit() {
 }
 
 func getJSON(url string, target interface{}) error {
-	r, err := http.Get(url)
+	r, err := jsonHTTPClient.Get(url)
 	if err != nil {
 		return err
 	}
 	defer r.Body.Close()
+	if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("GET %s: unexpected HTTP status %s", url, r.Status)
+	}
 
 	return json.NewDecoder(r.Body).Decode(target)
 }
 
 func getJSONwithHeaders(url string, target interface{}, headers map[string]string) error {
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 
-	r, err := client.Do(req)
+	r, err := jsonHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer r.Body.Close()
+	if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("GET %s: unexpected HTTP status %s", url, r.Status)
+	}
 
 	return json.NewDecoder(r.Body).Decode(target)
 }
@@ -231,29 +241,32 @@ func lg(group string, subgroup string, colorFunc func(string, ...interface{}) st
 		}
 	}
 
-	if bot != nil && botReady {
-		simplePrefix := group
-		if subgroup != "" {
-			simplePrefix += ":" + subgroup
-		}
-		for _, adminChannel := range config.AdminChannels {
-			if *adminChannel.LogProgram {
-				outputToChannel := func(channel string) {
-					if channel != "" {
-						if hasPerms(channel, discordgo.PermissionSendMessages) {
-							if _, err := bot.ChannelMessageSend(channel,
-								fmt.Sprintf("```%s | [%s] %s```",
-									time.Now().Format(time.RFC3339), simplePrefix, fmt.Sprintf(line, p...)),
-							); err != nil {
-								log.Println(color.HiRedString("Failed to send message...\t%s", err))
+	if botReady.Load() {
+		session := currentDiscordSession()
+		if session != nil {
+			simplePrefix := group
+			if subgroup != "" {
+				simplePrefix += ":" + subgroup
+			}
+			for _, adminChannel := range config.AdminChannels {
+				if *adminChannel.LogProgram {
+					outputToChannel := func(channel string) {
+						if channel != "" {
+							if hasPerms(channel, discordgo.PermissionSendMessages) {
+								if _, err := session.ChannelMessageSend(channel,
+									fmt.Sprintf("```%s | [%s] %s```",
+										time.Now().Format(time.RFC3339), simplePrefix, fmt.Sprintf(line, p...)),
+								); err != nil {
+									log.Println(color.HiRedString("Failed to send message...\t%s", err))
+								}
 							}
 						}
 					}
-				}
-				outputToChannel(adminChannel.ChannelID)
-				if adminChannel.ChannelIDs != nil {
-					for _, ch := range *adminChannel.ChannelIDs {
-						outputToChannel(ch)
+					outputToChannel(adminChannel.ChannelID)
+					if adminChannel.ChannelIDs != nil {
+						for _, ch := range *adminChannel.ChannelIDs {
+							outputToChannel(ch)
+						}
 					}
 				}
 			}

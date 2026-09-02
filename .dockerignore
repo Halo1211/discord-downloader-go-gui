@@ -1,0 +1,8 @@
+release/
+cache/
+database/
+settings.json
+*.exe
+*.exe~
+.tools/
+.git/

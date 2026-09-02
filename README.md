@@ -1,138 +1,135 @@
-<div align="center">
-    <img src="https://i.imgur.com/8KSripJ.png" alt="Discord Downloader Go"/>
-    <p>Maintained Late 2020 - Early 2025</p>
-    <p>Unfortunately I no longer have the free time or interest in continuing development and support for this project. Inactive/archived until further notice.</p>
-    <p><i><b>NOTE:</b> User Accounts / Self-bots often have rate limiting / connection issues.</i></p>
-</div>
-<p align="center">
-    <a href="https://travis-ci.com/get-got/discord-downloader-go" alt="Travis Build">
-        <img src="https://api.travis-ci.com/get-got/discord-downloader-go.svg?branch=master" />
-    </a>
-    <a href="https://goreportcard.com/report/github.com/get-got/discord-downloader-go" alt="Go Report Card">
-        <img src="https://goreportcard.com/badge/github.com/get-got/discord-downloader-go" />
-    </a>
-    <a href="https://goreportcard.com/report/github.com/get-got/discord-downloader-go" alt="Go Version">
-        <img src="https://img.shields.io/github/go-mod/go-version/get-got/discord-downloader-go" />
-    </a>
-    <br>
-    <a href="https://github.com/get-got/discord-downloader-go/releases" alt="All Releases">
-        <img src="https://img.shields.io/github/downloads/get-got/discord-downloader-go/total?label=all-releases&logo=GitHub" />
-    </a>
-    <a href="https://hub.docker.com/r/getgot/discord-downloader-go" alt="Docker Pulls">
-        <img src="https://img.shields.io/docker/pulls/getgot/discord-downloader-go?label=docker-pulls&logo=Docker" />
-    </a>
-    <a href="https://github.com/get-got/discord-downloader-go/releases/latest" alt="Latest Release">
-        <img src="https://img.shields.io/github/downloads/get-got/discord-downloader-go/latest/total?label=latest-release&logo=GitHub" />
-    </a>
-    <br>
-    <a href="https://discord.gg/6Z6FJZVaDV">
-        <img src="https://img.shields.io/discord/780985109608005703?logo=discord"alt="Join the Discord">
-    </a>
-</p>
-<h2 align="center">
-    <a href="https://github.com/get-got/discord-downloader-go/releases/latest">
-        <b>DOWNLOAD LATEST RELEASE</b>
-    </a>
-</h2><br>
+# Discord Downloader Go GUI
 
-<div align="center">
+![CI](https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml/badge.svg)
 
-This project is a cross-platform cli executable program to interact with a Discord Bot (genuine bot application or user account, limitations apply to both respectively) to locally download files posted from Discord in real-time as well as a full archive of old messages. It can download any directly sent Discord attachments or linked files and supports fetching highest possible quality files from specific sources _([see list below](#supported-download-sources))._
+A community-maintained Discord bot and desktop dashboard for downloading files
+from Discord in real time and for archiving older channel history. The project
+supports direct attachments, linked files, source resolvers, filtering,
+deduplication, resumable history jobs, and a local configuration dashboard.
 
-It also supports **very extensive** settings configurations and customization, applicable globally or per-server/category/channel/user. Tailor the bot to your exact needs and runtime environment.
+> **Important:** Use a genuine Discord bot account and bot token. Automated
+> normal-user accounts (self-bots/user-bots) are not supported and can result
+> in account termination by Discord.
 
-<h3 align="center">
-    <b>Originally a fork of <a href="https://github.com/Seklfreak/discord-image-downloader-go">Seklfreak's <i>discord-image-downloader-go</i></a></b>
-</h3>
-<h4 align="center">
-    The original project was abandoned, for a list of differences and why I made an independent project, <a href="#differences-from-seklfreaks-discord-image-downloader-go--why-i-made-this"><b>see below</b></a>
-</h4>
+This repository is the maintained GUI fork of
+[`get-got/discord-downloader-go`](https://github.com/get-got/discord-downloader-go).
+The canonical project repository, releases, and issue tracker are:
+[`Halo1211/discord-downloader-go-gui`](https://github.com/Halo1211/discord-downloader-go-gui).
 
----
+## Features
 
-<h3><a href="https://github.com/get-got/discord-downloader-go/wiki/Home">SEE THE WIKI FOR MORE</a></h3>
+- Windows desktop dashboard with WebView2 and system-tray support.
+- CLI mode for servers and headless environments.
+- Real-time downloads with a bounded worker queue and retry backoff.
+- Resumable history scans with cancellation and per-channel checkpoints.
+- Atomic file, database-backup, and history-cache writes.
+- Attachment, URL, emoji, sticker, and message-text handling.
+- Per-user, server, category, and channel rules.
+- File-type, extension, domain, phrase, role, reaction, and filename filters.
+- Optional content-type subfolders, reactions, forwarding, and logging.
+- JSON, JSONC, and YAML settings with a searchable GUI editor.
+- Secrets are masked in the GUI and blank secret fields preserve stored values.
 
-<h3>Wiki - <a href="https://github.com/get-got/discord-downloader-go/wiki/Getting-Started">Getting Started</a> </h3>
+Supported source resolvers currently include direct file links, Discord
+attachments, Twitter/X, Instagram, Imgur, Streamable, Gfycat, Tistory, and
+Flickr. Logged-in source resolvers use unofficial integrations and may change
+when the provider changes its website or API.
 
-<h3>Wiki - <a href="https://github.com/get-got/discord-downloader-go/wiki/Settings">Settings</a></h3>
+## Quick start
 
-<h3>Wiki - <a href="https://github.com/get-got/discord-downloader-go/wiki/Settings-Examples">Settings Examples</a></h3>
+### 1. Create and invite a Discord bot
 
-<h3>Wiki - <a href="https://github.com/get-got/discord-downloader-go/wiki/Guide-%E2%80%90-Commands">Guide - Commands</a></h3>
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Create an application and add a bot.
+3. Enable **Message Content Intent** under the bot's privileged intents.
+4. Invite the bot to every server it must monitor.
+5. Grant at least `View Channel` and `Read Message History`. Add `Send
+   Messages`, `Add Reactions`, or attachment-related permissions only when the
+   corresponding features are enabled.
 
-<h3>Wiki - <a href="https://github.com/get-got/discord-downloader-go/wiki/Guide-%E2%80%90-History-(Old-Messages)">Guide - History (Old Messages)</a></h3>
+The bot can only see channels in servers where it has been invited and granted
+the required permissions.
 
-| Operating System  | Architectures _( ? = available but untested )_    |
-| -----------------:|:----------------------------------------------- |
-| Windows           | **amd64**, arm64 _(?)_, armv7/6/5 _(?)_, 386 _(?)_
-| Linux             | **amd64**, **arm64**, **armv7/6/5**,<br/>risc-v64 _(?)_, mips64/64le _(?)_, s390x _(?)_, 386 _(?)_
-| Darwin (Mac)      | **amd64**, arm64 _(?)_
-| FreeBSD           | amd64 _(?)_, arm64 _(?)_, armv7/6/5 _(?)_, 386 _(?)_
-| OpenBSD           | amd64 _(?)_, arm64 _(?)_, armv7/6/5 _(?)_, 386 _(?)_
-| NetBSD            | amd64 _(?)_, arm64 _(?)_, armv7/6/5 _(?)_, 386 _(?)_
+### 2. Download a release
 
-</div>
+Download the asset for your platform from the
+[latest GitHub release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest).
+Extract the executable to a dedicated application directory. Do not run the
+program from a directory containing unrelated personal files.
 
----
+The local `release/` directory used by maintainers is ignored by Git and is
+not part of the source repository.
 
-## ⚠️ **WARNING!** Discord does not allow Automated User Accounts (Self-Bots/User-Bots)
+### 3. Configure the bot
 
-[Read more in Discord Trust & Safety Team's Official Statement...](https://support.discordapp.com/hc/en-us/articles/115002192352-Automated-user-accounts-self-bots-)
+Copy [`settings.example.json`](settings.example.json) to `settings.json`, then
+set the bot token and destination folder. The application creates a complete
+settings file with defaults when no settings file exists.
 
-While this project works for user logins, I do not recommend it as you risk account termination. If you can, [use a proper Discord Bot user for this program.](https://discord.com/developers/applications)
+On Windows, start the GUI executable:
 
-> _NOTE: This only applies to real User Accounts, not Bot users. This program currently works for either._
+```powershell
+discord-downloader-go-gui.exe
+```
 
----
+The dashboard listens on `127.0.0.1:7744` by default. Review the settings and
+press **Start application**. Set `guiAutoStart` to `true` when the dashboard
+should start the runtime without a button press.
 
-## 🤖 Features
+For a headless or terminal-only deployment:
 
-### Supported Download Sources
+```powershell
+discord-downloader-go-gui.exe --no-gui
+```
 
-- Direct Links to Files
-- Discord File Attachments
-- Twitter / X _(unofficial scraping, requires account login, see config section)_
-- Instagram _(unofficial scraping, requires account login, see config section)_
-- Imgur
-- Streamable
-- Gfycat
-- Tistory
-- Flickr _(requires API key, see config section)_
-- _I'll always welcome requests but some sources can be tricky to parse..._
+The GUI can also be opened in the system browser with `--gui-browser`. Useful
+options include `--gui-address=127.0.0.1:8899`, `--no-gui-open`, `--no-tray`,
+`--start-minimized`, `--gui-auto-start`, and `--config=my-settings`.
 
----
+## Documentation
 
-## ❔ FAQ
+- [Getting Started](docs/GETTING_STARTED.md) — bot creation, permissions, and first run.
+- [Settings Guide](docs/SETTINGS.md) — configuration structure, source rules, and tuning.
+- [Commands Guide](docs/COMMANDS.md) — bot commands and history controls.
+- [History Guide](docs/HISTORY.md) — archive scans, checkpoints, cancellation, and recovery.
+- [Architecture Map](ARCHITECTURE.md) — runtime flow, state boundaries, and persistence.
+- [Release Notes](RELEASE_NOTES.md) — changes included in the current release.
 
-- **_Q: How do I install?_**
-- **A: [SEE #getting-started](https://github.com/get-got/discord-downloader-go/wiki/Getting-Started)**
+## Reliability and security defaults
 
----
+Real-time downloads use four workers and a queue of 256 items by default. Each
+response is limited to 512 MiB and follows at most five redirects. History
+downloads use four workers and persist resumable checkpoints under
+`cache/history/`. Signed Discord CDN query parameters are normalized for
+deduplication, so refreshed attachment URLs do not create duplicate records.
 
-- **_Q: How do I convert from Seklfreak's discord-image-downloader-go?_**
-- **A: Place your config.ini from that program in the same directory as this program and delete any settings.json file if present. The program will import your settings from the old project and make a new settings.json. It will still re-download files that DIDG already downloaded, as the database layout is different and the old database is not imported.**
+The GUI binds only to loopback addresses, protects API calls with a random
+per-process token, applies restrictive security headers, and masks credentials
+when reading configuration. Keep the token out of screenshots, logs, backups,
+and issue reports.
 
----
+## Development
 
-### Differences from [Seklfreak's _discord-image-downloader-go_](https://github.com/Seklfreak/discord-image-downloader-go) & Why I made this
+Requirements: Go 1.24.1 or newer and a working C compiler only when your
+platform/toolchain requires one. Run the standard checks from the repository
+root:
 
-- _Better command formatting & support_
-- Configuration is JSON-based rather than ini to allow more elaborate settings and better organization. With this came many features such as channel-specific settings.
-- Channel-specific control of downloaded filetypes / content types (considers things like .mov as videos as well, rather than ignore them), Optional dividing of content types into separate folders.
-- (Optional) Reactions upon download success.
-- (Optional) Discord messages upon encountered errors.
-- Extensive bot status/presence customization.
-- Consistent Log Formatting, Color-Coded Logging
-- Somewhat different organization than original project; initially created from scratch then components ported over.
-- _Various fixes, improvements, and dependency updates that I also contributed to Seklfreak's original project._
+```powershell
+go test ./...
+go vet ./...
+go build ./...
+```
 
-> I've been a user of Seklfreak's project since ~2018 and it's been great for my uses, but there were certain aspects I wanted to expand upon, one of those being customization of channel configuration, and other features like message reactions upon success, differently formatted statuses, etc. If some aspects are rudimentary or messy, please make a pull request, as this is my first project using Go and I've learned everything from observation & Stack Overflow.
+The GitHub Actions workflows run formatting, tests, vet, and builds for pushes
+and pull requests. A tag matching `v*` builds Windows amd64, Linux amd64, and
+Linux arm64 release assets automatically.
 
----
+The project follows [Semantic Versioning](https://semver.org/) and
+[Conventional Commits](https://www.conventionalcommits.org/).
 
-## ⚙️ Development
+## License and attribution
 
-- I'm a complete amateur with Golang. If anything's bad please make a pull request.
-- Follows Semantic Versioning: `[MAJOR].[MINOR].[PATCH]` <https://semver.org/>
-- Follows Conventional Commits: `FEAT/FIX/REFACT/DOCS/CHORE/STYLE/TEST` <https://www.conventionalcommits.org/en/v1.0.0/>
-- [github.com/Seklfreak/discord-image-downloader-go - the original project this was founded on](https://github.com/Seklfreak/discord-image-downloader-go)
+This project is released under the license in [LICENSE](LICENSE). It began as
+a fork of [Seklfreak's discord-image-downloader-go](https://github.com/Seklfreak/discord-image-downloader-go)
+and later became an independent maintained fork of
+[`get-got/discord-downloader-go`](https://github.com/get-got/discord-downloader-go).

@@ -1,14 +1,16 @@
 package main
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"math/rand"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -40,6 +43,48 @@ type downloadItem struct {
 	Filename    string
 	ChannelID   string
 	UserID      string
+}
+
+func shouldReactToDownload(historyDownload bool, sourceConfig configurationSource) bool {
+	shouldReact := config.ReactWhenDownloaded
+	if sourceConfig.ReactWhenDownloaded != nil {
+		shouldReact = *sourceConfig.ReactWhenDownloaded
+	}
+	if historyDownload {
+		shouldReact = config.ReactWhenDownloadedHistory
+		if sourceConfig.ReactWhenDownloadedHistory != nil {
+			shouldReact = *sourceConfig.ReactWhenDownloadedHistory
+		}
+	}
+	return shouldReact
+}
+
+func shouldLogLinkStatus(status downloadStatus, logConfig *configurationSourceLog) bool {
+	if logConfig == nil {
+		return false
+	}
+	if status > downloadSuccess {
+		return logConfig.LogFailures != nil && *logConfig.LogFailures
+	}
+	return logConfig.LogDownloads != nil && *logConfig.LogDownloads
+}
+
+func chooseDownloadReaction(emojis []*discordgo.Emoji, blacklist []string, fallback string) string {
+	eligible := make([]string, 0, len(emojis))
+	for _, emoji := range emojis {
+		if emoji == nil || emoji.Animated {
+			continue
+		}
+		formatted := emoji.APIName()
+		if formatted == "" || stringInSlice(formatted, blacklist) {
+			continue
+		}
+		eligible = append(eligible, formatted)
+	}
+	if len(eligible) == 0 {
+		return fallback
+	}
+	return eligible[rand.Intn(len(eligible))]
 }
 
 type downloadStatus int
@@ -71,11 +116,92 @@ const (
 	downloadFailedCreatingSubfolder
 	downloadFailedWritingFile
 	downloadFailedWritingDatabase
+	downloadFailedFileTooLarge
 )
 
 type downloadStatusStruct struct {
 	Status downloadStatus
 	Error  error
+}
+
+type downloadHTTPStatusError struct {
+	statusCode int
+	status     string
+	retryAfter time.Duration
+}
+
+func (e *downloadHTTPStatusError) Error() string { return "HTTP " + e.status }
+
+var downloadHTTPTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 128
+	transport.MaxIdleConnsPerHost = 32
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.ForceAttemptHTTP2 = true
+	return transport
+}()
+
+func responseRetryAfter(response *http.Response) time.Duration {
+	for _, header := range []string{"Retry-After", "X-RateLimit-Reset-After"} {
+		value := strings.TrimSpace(response.Header.Get(header))
+		if value == "" {
+			continue
+		}
+		if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
+			delay := time.Duration(seconds * float64(time.Second))
+			if delay <= 0 || delay > 5*time.Minute {
+				return 5 * time.Minute
+			}
+			return delay
+		}
+		if retryTime, err := http.ParseTime(value); err == nil {
+			if delay := time.Until(retryTime); delay > 0 {
+				return delay
+			}
+		}
+	}
+	return 0
+}
+
+func boundedDownloadRetryDelay(delay time.Duration) time.Duration {
+	maximum := 30 * time.Second
+	if config.DownloadTimeout > 0 {
+		timeout := safeConfiguredDuration(config.DownloadTimeout, time.Second)
+		if timeout < maximum {
+			maximum = timeout
+		}
+	}
+	if delay <= 0 {
+		return time.Second
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func effectiveDownloadRetryAttempts(configured int) int {
+	if configured < 1 {
+		return 1
+	}
+	if configured > maxConfigDownloadRetry {
+		return maxConfigDownloadRetry
+	}
+	return configured
+}
+
+func validDownloadURL(input string) (*url.URL, error) {
+	parsed, err := url.ParseRequestURI(input)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported download URL scheme %q", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" {
+		return nil, errors.New("download URL is missing a host")
+	}
+	return parsed, nil
 }
 
 type fileItem struct {
@@ -149,6 +275,8 @@ func getDownloadStatus(status downloadStatus) string {
 		return "Failed - Error Saving File"
 	case downloadFailedWritingDatabase:
 		return "Failed - Error Saving to Database"
+	case downloadFailedFileTooLarge:
+		return "Failed - File Exceeds Configured Size Limit"
 	}
 	return "Unknown Error"
 }
@@ -172,6 +300,9 @@ func trimDuplicateLinks(fileItems []*fileItem) []*fileItem {
 	seen := map[string]bool{}
 
 	for _, item := range fileItems {
+		if item == nil || item.Link == "" {
+			continue
+		}
 		if seen[item.Link] {
 			continue
 		}
@@ -184,30 +315,52 @@ func trimDuplicateLinks(fileItems []*fileItem) []*fileItem {
 }
 
 // Trim files already downloaded and stored in database
+func normalizeDownloadURL(inputURL string) string {
+	parsedURL, err := url.Parse(inputURL)
+	if err != nil {
+		return inputURL
+	}
+	// URI fragments are client-side navigation metadata and are never sent in
+	// an HTTP request, so they cannot distinguish downloaded resources.
+	parsedURL.Fragment = ""
+	parsedURL.RawFragment = ""
+	parsedURL.Scheme = strings.ToLower(parsedURL.Scheme)
+	hostname := strings.ToLower(parsedURL.Hostname())
+	port := parsedURL.Port()
+	if (parsedURL.Scheme == "http" && port == "80") || (parsedURL.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		parsedURL.Host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		parsedURL.Host = "[" + hostname + "]"
+	} else {
+		parsedURL.Host = hostname
+	}
+	host := strings.ToLower(parsedURL.Hostname())
+	if host == "cdn.discordapp.com" || host == "media.discordapp.net" ||
+		strings.HasSuffix(host, ".discordapp.com") || strings.HasSuffix(host, ".discordapp.net") {
+		// Discord CDN attachment URLs contain expiring ex/is/hm signatures.
+		// Keep only the format hint so the same attachment is idempotent across
+		// message fetches and refreshed CDN signatures.
+		format := parsedURL.Query().Get("format")
+		parsedURL.RawQuery = ""
+		if format != "" {
+			parsedURL.RawQuery = "format=" + url.QueryEscape(format)
+		}
+	}
+	return parsedURL.String()
+}
+
 func pruneCompletedLinks(linkList map[string]string, m *discordgo.Message) map[string]string {
 	sourceConfig := getSource(m)
 
 	newList := make(map[string]string, 0)
 	for link, filename := range linkList {
-		alreadyDownloaded := false
-		testLink := link
-
-		parsedURL, err := url.Parse(testLink)
-		if err == nil {
-			if parsedURL.Hostname() == "cdn.discordapp.com" {
-				if strings.Contains(parsedURL.String(), "format=") {
-					parsedURL.RawQuery = "format=" + parsedURL.Query().Get("format")
-				} else {
-					parsedURL.RawQuery = ""
-				}
-				testLink = parsedURL.String()
-			}
-		}
-
-		for _, downloadedFile := range dbFindDownloadByURL(testLink) {
-			if downloadedFile.ChannelID == m.ChannelID {
-				alreadyDownloaded = true
-			}
+		testLink := normalizeDownloadURL(link)
+		alreadyDownloaded := dbHasDownload(testLink, m.ChannelID)
+		if !alreadyDownloaded && downloadIsInFlight(testLink, m.ChannelID) {
+			alreadyDownloaded = true
 		}
 
 		savePossibleDuplicates := false
@@ -226,6 +379,9 @@ func pruneCompletedLinks(linkList map[string]string, m *discordgo.Message) map[s
 
 func getRawLinks(m *discordgo.Message) []*fileItem {
 	var links []*fileItem
+	if m == nil {
+		return links
+	}
 
 	// Fix source author if nil
 	if m.Author == nil {
@@ -275,6 +431,9 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 
 	// Search Discord Message Snapshots (forwarded messages)
 	for _, snapshot := range m.MessageSnapshots {
+		if snapshot.Message == nil {
+			continue
+		}
 		// Attachments
 		for _, attachment := range snapshot.Message.Attachments {
 			links = append(links, &fileItem{
@@ -315,6 +474,9 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 
 	// Search Detected Links in Discord Message Snapshots (forwarded messages)
 	for _, snapshot := range m.MessageSnapshots {
+		if snapshot.Message == nil {
+			continue
+		}
 		foundLinks := xurls.Strict().FindAllString(snapshot.Message.Content, -1)
 		for _, foundLink := range foundLinks {
 			links = append(links, &fileItem{
@@ -341,44 +503,42 @@ func getParsedLinks(inputURL string, m *discordgo.Message) map[string]string {
 	inputURL = strings.ReplaceAll(inputURL, "//x.com", "//twitter.com")
 	inputURL = strings.ReplaceAll(inputURL, ".x.com", ".twitter.com")
 	inputURL = strings.ReplaceAll(inputURL, "𝕏", "x")
-	if twitterConnected {
-		if regexUrlTwitter.MatchString(inputURL) {
-			links, err := getTwitterUrls(inputURL)
-			if err != nil {
-				if !strings.Contains(err.Error(), "suspended") {
-					log.Println(lg("Download", "", color.RedString, "Twitter Media fetch failed for %s -- %s", inputURL, err))
-				}
-			} else if len(links) > 0 {
-				return pruneCompletedLinks(links, m)
-			}
+	// Direct Twitter CDN media does not require an authenticated scraper.
+	if regexUrlTwitter.MatchString(inputURL) {
+		links, err := getTwitterUrls(inputURL)
+		if err != nil {
+			log.Println(lg("Download", "", color.RedString, "Twitter Media fetch failed for %s -- %s", inputURL, err))
+		} else if len(links) > 0 {
+			return pruneCompletedLinks(links, m)
 		}
-		if regexUrlTwitterStatus.MatchString(inputURL) {
-			links, err := getTwitterStatusUrls(inputURL, m)
-			if err != nil {
-				if !strings.Contains(err.Error(), "suspended") && !strings.Contains(err.Error(), "No status found") {
-					log.Println(lg("Download", "", color.RedString, "Twitter Status fetch failed for %s -- %s", inputURL, err))
-				}
-			} else if len(links) > 0 {
-				return pruneCompletedLinks(links, m)
+	}
+	if twitterConnected && regexUrlTwitterStatus.MatchString(inputURL) {
+		links, err := getTwitterStatusUrls(inputURL, m)
+		if err != nil {
+			if !strings.Contains(err.Error(), "suspended") && !strings.Contains(err.Error(), "No status found") {
+				log.Println(lg("Download", "", color.RedString, "Twitter Status fetch failed for %s -- %s", inputURL, err))
 			}
+		} else if len(links) > 0 {
+			return pruneCompletedLinks(links, m)
 		}
-	} else if strings.Contains(inputURL, "twitter.com") {
-		return pruneCompletedLinks(map[string]string{inputURL: ""}, m)
+	} else if regexUrlTwitterStatus.MatchString(inputURL) {
+		// Do not save an X/Twitter HTML page as if it were archived media.
+		return map[string]string{}
 	}
 
 	// Instagram
-	if instagramConnected {
-		if regexUrlInstagram.MatchString(inputURL) || regexUrlInstagramReel.MatchString(inputURL) {
-			if strings.Contains(inputURL, "?") {
-				inputURL = inputURL[:strings.Index(inputURL, "?")]
-			}
-			links, err := getInstagramUrls(inputURL, m)
-			if err != nil {
-				log.Println(lg("Download", "", color.RedString, "Instagram media fetch failed for %s -- %s", inputURL, err))
-			} else if len(links) > 0 {
-				return pruneCompletedLinks(links, m)
-			}
+	if regexUrlInstagram.MatchString(inputURL) || regexUrlInstagramReel.MatchString(inputURL) || regexUrlInstagramTV.MatchString(inputURL) {
+		if !instagramConnected {
+			return map[string]string{}
 		}
+		links, err := getInstagramUrls(inputURL, m)
+		if err != nil {
+			log.Println(lg("Download", "", color.RedString, "Instagram media fetch failed for %s -- %s", inputURL, err))
+		} else if len(links) > 0 {
+			return pruneCompletedLinks(links, m)
+		}
+		// Do not save an Instagram HTML page when media extraction fails.
+		return map[string]string{}
 	}
 
 	// Imgur (Legacy from DIDG)
@@ -575,29 +735,181 @@ type downloadRequestStruct struct {
 	AttachmentID   string
 }
 
+var downloadWriteMu sync.Mutex
+var cachedDownloadIDMu sync.Mutex
+
+func nextCachedDownloadID() int {
+	cachedDownloadIDMu.Lock()
+	cachedDownloadID++
+	id := cachedDownloadID
+	cachedDownloadIDMu.Unlock()
+	return id
+}
+
+func setCachedDownloadID(value int) {
+	cachedDownloadIDMu.Lock()
+	cachedDownloadID = value
+	cachedDownloadIDMu.Unlock()
+}
+
+func writeFileAtomic(filename string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".*.part")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, filename); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func downloadDomainAllowed(domain string, filters *configurationSourceFilters) bool {
+	if filters == nil {
+		return true
+	}
+	domain = strings.ToLower(domain)
+	if filters.BlockedDomains != nil {
+		for _, blocked := range *filters.BlockedDomains {
+			if strings.EqualFold(domain, blocked) {
+				return false
+			}
+		}
+	}
+	if filters.AllowedDomains != nil {
+		for _, allowed := range *filters.AllowedDomains {
+			if strings.EqualFold(domain, allowed) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func pathIsWithinBase(basePath, targetPath string) bool {
+	absBase, err := filepath.Abs(basePath)
+	if err != nil {
+		return false
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(absBase, absTarget)
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator))
+}
+
+func downloadLinkContentAllowed(link string, filters *configurationSourceFilters) bool {
+	if filters == nil {
+		return true
+	}
+	if filters.BlockedLinkContent != nil {
+		for _, phrase := range *filters.BlockedLinkContent {
+			if phrase != "" && strings.Contains(link, phrase) {
+				return false
+			}
+		}
+	}
+	if filters.AllowedLinkContent != nil {
+		for _, phrase := range *filters.AllowedLinkContent {
+			if phrase != "" && strings.Contains(link, phrase) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func formattedDownloadSubfolders(sourceConfig configurationSource, download downloadRequestStruct, contentTypeBase string) []string {
+	if sourceConfig.Subfolders == nil {
+		return nil
+	}
+	format := func(template string) string {
+		formatted := strings.ReplaceAll(template, "{{fileType}}", contentTypeBase+"s")
+		formatted = dataKeys_DiscordMessage(formatted, download.Message)
+		return safePathComponent(clearSourceField(formatted, sourceConfig))
+	}
+
+	subfolders := make([]string, 0, len(*sourceConfig.Subfolders))
+	for _, subfolder := range *sourceConfig.Subfolders {
+		formatted := format(subfolder)
+		if strings.Contains(formatted, "{{") && strings.Contains(formatted, "}}") &&
+			sourceConfig.SubfoldersFallback != nil {
+			subfolders = make([]string, 0, len(*sourceConfig.SubfoldersFallback))
+			for _, fallback := range *sourceConfig.SubfoldersFallback {
+				subfolders = append(subfolders, format(fallback))
+			}
+			break
+		}
+		subfolders = append(subfolders, formatted)
+	}
+	return subfolders
+}
+
 func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, int64) {
 	status := mDownloadStatus(downloadFailed)
 	var tempfilesize int64 = -1
-	for i := 0; i < config.DownloadRetryMax; i++ {
+	attempts := effectiveDownloadRetryAttempts(config.DownloadRetryMax)
+	for i := 0; i < attempts; i++ {
 		status, tempfilesize = download.tryDownload()
-		// Success or Skip
-		if status.Status < downloadFailed || status.Status == downloadFailedCode404 {
+		if status.Status < downloadFailed || !downloadStatusRetryable(status.Status) || i == attempts-1 {
 			break
-		} else {
-			time.Sleep(5 * time.Second)
 		}
+		// Exponential backoff with jitter prevents a group of failed downloads
+		// from retrying in lockstep and gives transient CDN failures time to heal.
+		var httpStatusError *downloadHTTPStatusError
+		var delay time.Duration
+		if errors.As(status.Error, &httpStatusError) && httpStatusError.retryAfter > 0 {
+			delay = httpStatusError.retryAfter
+		} else {
+			backoff := time.Duration(1<<min(i, 5)) * time.Second
+			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+			delay = backoff + jitter
+		}
+		if waitForRuntimeStop(boundedDownloadRetryDelay(delay)) {
+			return status, tempfilesize
+		}
+	}
+	if runtimeIsStopping() {
+		return status, tempfilesize
 	}
 
 	// Any kind of failure
 	if status.Status >= downloadFailed && !download.HistoryCmd && !download.EmojiCmd {
 		log.Println(lg("Download", "", color.RedString,
 			"Gave up on downloading %s after %d failed attempts...\t%s",
-			download.InputURL, config.DownloadRetryMax, getDownloadStatus(status.Status)))
+			download.InputURL, attempts, getDownloadStatus(status.Status)))
 		if sourceConfig := getSource(download.Message); sourceConfig != emptySourceConfig {
 			if !download.HistoryCmd && *sourceConfig.SendErrorMessages {
 				content := fmt.Sprintf(
 					"Gave up trying to download\n<%s>\nafter %d failed attempts...\n\n``%s``",
-					download.InputURL, config.DownloadRetryMax, getDownloadStatus(status.Status))
+					download.InputURL, attempts, getDownloadStatus(status.Status))
 				if status.Error != nil {
 					content += fmt.Sprintf("\n```ERROR: %s```", status.Error)
 				}
@@ -638,7 +950,7 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 				if sourceConfig.LogLinks.Destination != "" {
 
 					encounteredErrors := false
-					savePath := sourceConfig.LogLinks.Destination + string(os.PathSeparator)
+					savePath := filepath.Clean(sourceConfig.LogLinks.Destination)
 
 					// Subfolder Division - Format Subfolders
 					if sourceConfig.LogLinks.Subfolders != nil {
@@ -663,27 +975,25 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 									// Scrub subfolder
 									newSubfolder2 = clearSourceLogField(newSubfolder2, *sourceConfig.LogLinks)
 
-									subfolders = append(subfolders, newSubfolder2)
+									subfolders = append(subfolders, safePathComponent(newSubfolder2))
 								}
 								break
 							} else {
-								subfolders = append(subfolders, newSubfolder)
+								subfolders = append(subfolders, safePathComponent(newSubfolder))
 							}
 						}
 
-						// Subfolder Dividion - Handle Formatted Subfolders
-						subpath := ""
-						for _, subfolder := range subfolders {
-							subpath = subpath + subfolder + string(os.PathSeparator)
-							// Create folder
-							if err := os.MkdirAll(filepath.Clean(savePath+subpath), 0755); err != nil {
-								log.Println(lg("LogLinks", "", color.HiRedString,
-									"Error while creating subfolder \"%s\": %s", savePath+subpath, err))
-								encounteredErrors = true
-							}
+						// Subfolder Division - Handle Formatted Subfolders
+						var pathErr error
+						savePath, pathErr = safePathUnderBase(savePath, subfolders...)
+						if pathErr != nil {
+							log.Println(lg("LogLinks", "", color.HiRedString, "Invalid log subfolder path: %s", pathErr))
+							encounteredErrors = true
+						} else if err := os.MkdirAll(savePath, 0755); err != nil {
+							log.Println(lg("LogLinks", "", color.HiRedString,
+								"Error while creating subfolder \"%s\": %s", savePath, err))
+							encounteredErrors = true
 						}
-						// Format Path
-						savePath = filepath.Clean(savePath + subpath) // overwrite with new destination path
 					}
 
 					if !encounteredErrors {
@@ -706,10 +1016,14 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 							}
 
 							// Scrub filename
-							filename = clearSourceLogField(filename, *sourceConfig.LogLinks)
+							filename = safePathComponent(clearSourceLogField(filename, *sourceConfig.LogLinks))
 
 							// Build path
-							logPath := filepath.Clean(savePath + string(os.PathSeparator) + filename)
+							logPath, pathErr := safePathUnderBase(savePath, filename)
+							if pathErr != nil {
+								log.Println(lg("Download", "LogLinks", color.HiRedString, "Invalid log filename: %s", pathErr))
+								return status, tempfilesize
+							}
 
 							// Format New Line
 							var newLine string
@@ -756,39 +1070,10 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 							}
 							newLine += "\n" + prefix + lineContent + suffix
 
-							// Read
-							currentLog := ""
-							if logfile, err := os.ReadFile(logPath); err == nil {
-								currentLog = string(logfile)
-							}
-							canLog := true
-							// Log Failures
-							if status.Status > downloadSuccess {
-								canLog = *sourceConfig.LogLinks.LogFailures // will not log if LogFailures is false
-							} else if *sourceConfig.LogLinks.LogDownloads { // Log Downloads
-								canLog = true
-							}
-							// Filter Duplicates
-							if sourceConfig.LogLinks.FilterDuplicates != nil {
-								if *sourceConfig.LogLinks.FilterDuplicates {
-									if strings.Contains(currentLog, newLine) {
-										canLog = false
-									}
-								}
-							}
-
-							if canLog {
-								// Writer
-								f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0600)
-								if err != nil {
-									log.Println(lg("Download", "LogLinks", color.RedString, "[sourceConfig.LogLinks] Failed to open log file:\t%s", err))
-									f.Close()
-								}
-								defer f.Close()
-
-								if _, err = f.WriteString(newLine); err != nil {
-									log.Println(lg("Download", "LogLinks", color.RedString, "[sourceConfig.LogLinks] Failed to append file:\t%s", err))
-								}
+							canLog := shouldLogLinkStatus(status.Status, sourceConfig.LogLinks)
+							filterDuplicates := sourceConfig.LogLinks.FilterDuplicates != nil && *sourceConfig.LogLinks.FilterDuplicates
+							if _, err := appendSourceLogLine(logPath, newLine, filterDuplicates, canLog); err != nil {
+								log.Println(lg("Download", "LogLinks", color.RedString, "[sourceConfig.LogLinks] Failed to append log file:\t%s", err))
 							}
 						}
 					}
@@ -800,10 +1085,36 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 	return status, tempfilesize
 }
 
+func downloadStatusRetryable(status downloadStatus) bool {
+	switch status {
+	case downloadFailedCode, downloadFailedRequesting,
+		downloadFailedDownloadingResponse, downloadFailedReadResponse,
+		downloadFailedWritingFile:
+		return true
+	default:
+		return false
+	}
+}
+
 func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64) {
 	var err error
+	if !download.EmojiCmd && download.Message == nil {
+		return mDownloadStatus(downloadFailedInvalidSource, errors.New("download request is missing its Discord message")), 0
+	}
 
-	cachedDownloadID++
+	downloadID := nextCachedDownloadID()
+	duploReserved := false
+	duploCommitted := false
+	defer func() {
+		if !duploReserved || duploCommitted {
+			return
+		}
+		duploMu.Lock()
+		if duploCatalog != nil {
+			duploCatalog.Delete(downloadID)
+		}
+		duploMu.Unlock()
+	}()
 
 	logPrefix := ""
 	if download.HistoryCmd {
@@ -824,43 +1135,19 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 	if sourceConfigNew != emptySourceConfig || download.EmojiCmd || download.ManualDownload {
 
 		// Source validation
-		if _, err = url.ParseRequestURI(download.InputURL); err != nil {
-			return mDownloadStatus(downloadFailedInvalidSource, err), 0
+		parsedURL, parseErr := validDownloadURL(download.InputURL)
+		if parseErr != nil {
+			return mDownloadStatus(downloadFailedInvalidSource, parseErr), 0
 		}
 
 		// Check Domain
-		domain := "<DOMAIN PARSE FAILED>"
-		parsedURL, err := url.Parse(download.InputURL)
-		if err != nil {
-			log.Println(lg("Download", "", color.RedString, "Error while parsing url:\t%s", err))
-		} else {
-			domain = parsedURL.Hostname()
-			if sourceConfig.Filters.AllowedDomains != nil || sourceConfig.Filters.BlockedDomains != nil {
-				shouldAbort := false
-				if sourceConfig.Filters.AllowedDomains != nil {
-					shouldAbort = true
-				}
-
-				if sourceConfig.Filters.BlockedDomains != nil {
-					if stringInSlice(domain, *sourceConfig.Filters.BlockedDomains) {
-						shouldAbort = true
-					}
-				}
-				if sourceConfig.Filters.AllowedDomains != nil {
-					if stringInSlice(domain, *sourceConfig.Filters.AllowedDomains) {
-						shouldAbort = false
-					}
-				}
-
-				// Abort
-				if shouldAbort {
-					if !download.HistoryCmd {
-						log.Println(lg("Download", "Skip", color.GreenString,
-							"Unpermitted domain (%s) found at %s", domain, download.InputURL))
-					}
-					return mDownloadStatus(downloadSkippedUnpermittedDomain), 0
-				}
+		domain := parsedURL.Hostname()
+		if !downloadDomainAllowed(domain, sourceConfig.Filters) {
+			if !download.HistoryCmd {
+				log.Println(lg("Download", "Skip", color.GreenString,
+					"Unpermitted domain (%s) found at %s", domain, download.InputURL))
 			}
+			return mDownloadStatus(downloadSkippedUnpermittedDomain), 0
 		}
 
 		// Clean/fix path
@@ -881,16 +1168,24 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		}
 
 		// Request
-		timeout := time.Duration(time.Duration(config.DownloadTimeout) * time.Second)
-		client := &http.Client{
-			Timeout: timeout,
+		timeout := safeConfiguredDuration(config.DownloadTimeout, time.Second)
+		client := &http.Client{Timeout: timeout, Transport: downloadHTTPTransport}
+		client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+			if len(via) > config.DownloadMaxRedirects {
+				return fmt.Errorf("too many redirects (limit %d)", config.DownloadMaxRedirects)
+			}
+			redirectDomain := strings.ToLower(request.URL.Hostname())
+			if !downloadDomainAllowed(redirectDomain, sourceConfig.Filters) {
+				return fmt.Errorf("redirected to unpermitted domain %s", redirectDomain)
+			}
+			return nil
 		}
-		request, err := http.NewRequest("GET", download.InputURL, nil)
-		request.Header.Set("User-Agent", sneakyUserAgent)
+		request, err := http.NewRequest(http.MethodGet, download.InputURL, nil)
 		if err != nil {
 			log.Println(lg("Download", "", color.HiRedString, "Error while requesting \"%s\": %s", download.InputURL, err))
 			return mDownloadStatus(downloadFailedRequesting, err), 0
 		}
+		request.Header.Set("User-Agent", sneakyUserAgent)
 		request.Header.Add("Accept-Encoding", "identity")
 		response, err := client.Do(request)
 		if err != nil {
@@ -902,39 +1197,75 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 			return mDownloadStatus(downloadFailedDownloadingResponse, err), 0
 		}
 		defer response.Body.Close()
-
-		// Read
-		bodyOfResp, err := io.ReadAll(response.Body)
-		if err != nil {
-			log.Println(lg("Download", "", color.HiRedString,
-				"Could not read response from \"%s\": %s",
-				download.InputURL, err))
-			return mDownloadStatus(downloadFailedReadResponse, err), 0
-		}
-
-		// Errors
-		if response.StatusCode >= 400 {
-			// Output
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			statusErr := &downloadHTTPStatusError{
+				statusCode: response.StatusCode,
+				status:     response.Status,
+				retryAfter: responseRetryAfter(response),
+			}
 			logHistoryErrors := true
-			if sourceConfig.OutputHistoryStatus != nil {
-				logHistoryErrors = *sourceConfig.OutputHistoryStatus
+			if sourceConfig.OutputHistoryErrors != nil {
+				logHistoryErrors = *sourceConfig.OutputHistoryErrors
 			}
 			if logHistoryErrors {
 				log.Println(lg("Download", "", color.HiRedString, logPrefix+"DOWNLOAD FAILED, %d %s: %s",
 					response.StatusCode, http.StatusText(response.StatusCode), download.InputURL))
 			}
-			// Return
-			if response.StatusCode == 403 {
-				return mDownloadStatus(downloadFailedCode403, err), 0
-			} else if response.StatusCode == 404 {
-				return mDownloadStatus(downloadFailedCode404, err), 0
-			} else {
-				return mDownloadStatus(downloadFailedCode, err), 0
+			switch response.StatusCode {
+			case http.StatusForbidden:
+				return mDownloadStatus(downloadFailedCode403, statusErr), 0
+			case http.StatusNotFound:
+				return mDownloadStatus(downloadFailedCode404, statusErr), 0
+			default:
+				return mDownloadStatus(downloadFailedCode, statusErr), 0
 			}
 		}
 
+		// Stream the response to a temporary file so large downloads do not occupy
+		// the process heap. The file is removed unless it is atomically promoted.
+		tempFile, err := os.CreateTemp(download.Path, ".ddg-download-*.part")
+		if err != nil {
+			return mDownloadStatus(downloadFailedWritingFile, err), 0
+		}
+		tempDownloadPath := tempFile.Name()
+		defer os.Remove(tempDownloadPath)
+		if response.ContentLength > config.DownloadMaxFileSize {
+			tempFile.Close()
+			return mDownloadStatus(downloadFailedFileTooLarge,
+				fmt.Errorf("content length %d exceeds limit %d", response.ContentLength, config.DownloadMaxFileSize)), 0
+		}
+		responseReader := io.Reader(response.Body)
+		if config.DownloadMaxFileSize < math.MaxInt64 {
+			responseReader = io.LimitReader(response.Body, config.DownloadMaxFileSize+1)
+		}
+		bytesWritten, err := io.Copy(tempFile, responseReader)
+		if err != nil {
+			tempFile.Close()
+			log.Println(lg("Download", "", color.HiRedString,
+				"Could not read response from \"%s\": %s",
+				download.InputURL, err))
+			return mDownloadStatus(downloadFailedReadResponse, err), 0
+		}
+		if err := tempFile.Close(); err != nil {
+			return mDownloadStatus(downloadFailedReadResponse, err), 0
+		}
+		if bytesWritten > config.DownloadMaxFileSize {
+			return mDownloadStatus(downloadFailedFileTooLarge,
+				fmt.Errorf("response exceeds limit %d bytes", config.DownloadMaxFileSize)), 0
+		}
+
 		// Content Type
-		contentType := http.DetectContentType(bodyOfResp)
+		headFile, err := os.Open(tempDownloadPath)
+		if err != nil {
+			return mDownloadStatus(downloadFailedReadResponse, err), 0
+		}
+		head := make([]byte, 512)
+		headCount, headErr := headFile.Read(head)
+		headFile.Close()
+		if headErr != nil && headErr != io.EOF {
+			return mDownloadStatus(downloadFailedReadResponse, headErr), 0
+		}
+		contentType := http.DetectContentType(head[:headCount])
 		contentTypeParts := strings.Split(contentType, "/")
 		contentTypeBase := contentTypeParts[0]
 		isHtml := strings.Contains(contentType, "text/html")
@@ -942,16 +1273,14 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		// Filename
 		if download.Filename == "" {
 			download.Filename = filenameFromURL(response.Request.URL.String())
-			for key, iHeader := range response.Header {
-				if key == "Content-Disposition" {
-					if _, params, err := mime.ParseMediaType(iHeader[0]); err == nil {
-						newFilename, err := url.QueryUnescape(params["filename"])
-						if err != nil {
-							newFilename = params["filename"]
-						}
-						if newFilename != "" {
-							download.Filename = newFilename
-						}
+			if disposition := response.Header.Get("Content-Disposition"); disposition != "" {
+				if _, params, err := mime.ParseMediaType(disposition); err == nil {
+					// mime.ParseMediaType already decodes RFC 5987 filename* values.
+					// Decoding again corrupts literal percent sequences such as %20;
+					// regular filename values are not URL-encoded by the standard.
+					newFilename := params["filename"]
+					if newFilename != "" {
+						download.Filename = newFilename
 					}
 				}
 			}
@@ -990,7 +1319,8 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		}
 
 		// Check Reactions
-		if sourceConfig.Filters.AllowedReactions != nil || sourceConfig.Filters.BlockedReactions != nil {
+		if download.Message != nil &&
+			(sourceConfig.Filters.AllowedReactions != nil || sourceConfig.Filters.BlockedReactions != nil) {
 			shouldAbort := false
 			if sourceConfig.Filters.AllowedReactions != nil {
 				shouldAbort = true
@@ -1038,18 +1368,15 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		}
 
 		// Scrub Filename
-		download.Filename = clearSourceField(download.Filename, sourceConfig)
+		download.Filename = safePathComponent(clearSourceField(download.Filename, sourceConfig))
 
-		// Fix filename length
-		if len(download.Filename) >= 260 {
-			download.Filename = download.Filename[:250]
-			download.Filename += download.Extension
-		}
+		// Keep the final path component portable and never split Unicode bytes.
+		download.Filename = limitFilenameBytes(download.Filename, 255)
 
 		// Swap Extensions
 		if download.Extension == ".jfif" || download.Extension == ".jpglarge" || download.Extension == ".jpeglarge" {
 			download.Extension = ".jpg"
-			download.Filename = strings.ReplaceAll(download.Filename, ".jfif", ".jpg")
+			download.Filename = strings.TrimSuffix(download.Filename, filepath.Ext(download.Filename)) + download.Extension
 		}
 
 		// Fix content type using extension
@@ -1093,12 +1420,22 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 			}
 		}
 
-		// Check content type
-		if !((*sourceConfig.SaveImages && contentTypeBase == "image") ||
-			(*sourceConfig.SaveVideos && contentTypeBase == "video") ||
-			(*sourceConfig.SaveAudioFiles && contentTypeBase == "audio") ||
-			(*sourceConfig.SaveTextFiles && contentTypeBase == "text" && !isHtml) ||
-			(*sourceConfig.SaveOtherFiles && contentTypeBase == "application")) {
+		// Check content type. "Other" covers every non-media/text top-level
+		// type (for example font/* and model/*), not only application/*.
+		contentTypeAllowed := false
+		switch contentTypeBase {
+		case "image":
+			contentTypeAllowed = *sourceConfig.SaveImages
+		case "video":
+			contentTypeAllowed = *sourceConfig.SaveVideos
+		case "audio":
+			contentTypeAllowed = *sourceConfig.SaveAudioFiles
+		case "text":
+			contentTypeAllowed = *sourceConfig.SaveTextFiles && !isHtml
+		default:
+			contentTypeAllowed = *sourceConfig.SaveOtherFiles && !isHtml
+		}
+		if !contentTypeAllowed {
 			if !download.HistoryCmd && !isHtml {
 				log.Println(lg("Download", "Skip", color.GreenString,
 					"Unpermitted filetype (%s) found at %s", contentTypeBase, download.InputURL))
@@ -1107,23 +1444,44 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		}
 
 		// Duplicate Image Filter
-		if config.Duplo && contentTypeBase == "image" && download.Extension != ".gif" && download.Extension != ".webp" {
-			img, _, err := image.Decode(bytes.NewReader(bodyOfResp))
+		duploEnabled := config.Duplo
+		if sourceConfig.Duplo != nil {
+			duploEnabled = *sourceConfig.Duplo
+		}
+		if duploEnabled && contentTypeBase == "image" && download.Extension != ".gif" && download.Extension != ".webp" {
+			imageFile, openErr := os.Open(tempDownloadPath)
+			if openErr != nil {
+				return mDownloadStatus(downloadFailedReadResponse, openErr), 0
+			}
+			img, _, err := image.Decode(imageFile)
+			imageFile.Close()
 			if err != nil {
 				log.Println(lg("Duplo", "Download", color.HiRedString,
 					"Error converting buffer to image for hashing:\t%s", err))
 			} else {
 				hash, _ := duplo.CreateHash(img)
-				matches := duploCatalog.Query(hash)
-				sort.Sort(matches)
-				for _, match := range matches {
-					if match.Score < config.DuploThreshold {
-						log.Println(lg("Duplo", "Download", color.GreenString,
-							"Duplicate detected (Score of %f) found at %s", match.Score, download.InputURL))
-						return mDownloadStatus(downloadSkippedDetectedDuplicate), 0
+				isDuplicate := func() bool {
+					duploMu.Lock()
+					defer duploMu.Unlock()
+					if duploCatalog == nil {
+						duploCatalog = duplo.New()
 					}
+					matches := duploCatalog.Query(hash)
+					sort.Sort(matches)
+					for _, match := range matches {
+						if match.Score < config.DuploThreshold {
+							log.Println(lg("Duplo", "Download", color.GreenString,
+								"Duplicate detected (Score of %f) found at %s", match.Score, download.InputURL))
+							return true
+						}
+					}
+					duploCatalog.Add(downloadID, hash)
+					duploReserved = true
+					return false
+				}()
+				if isDuplicate {
+					return mDownloadStatus(downloadSkippedDetectedDuplicate), 0
 				}
-				duploCatalog.Add(cachedDownloadID, hash)
 			}
 		}
 
@@ -1166,52 +1524,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 
 			// Subfolder Division - Format Subfolders
 			if sourceConfig.Subfolders != nil {
-				keys := [][]string{
-					{"{{fileType}}",
-						contentTypeBase + "s"},
-				}
-				subfolders := []string{}
-				for _, subfolder := range *sourceConfig.Subfolders {
-					fmtSubfolder := subfolder
-					if strings.Contains(subfolder, "{{") && strings.Contains(subfolder, "}}") {
-						for _, key := range keys {
-							if strings.Contains(fmtSubfolder, key[0]) {
-								fmtSubfolder = strings.ReplaceAll(fmtSubfolder, key[0], key[1])
-							}
-						}
-						// all other keys ...
-						fmtSubfolder = dataKeys_DiscordMessage(fmtSubfolder, download.Message)
-					}
-
-					// Scrub Subfolder
-					fmtSubfolder = clearSourceField(fmtSubfolder, sourceConfig)
-
-					// Do Fallback if a line contains an unparsed key (if fallback exists).
-					if strings.Contains(fmtSubfolder, "{{") && strings.Contains(fmtSubfolder, "}}") &&
-						sourceConfig.SubfoldersFallback != nil {
-						subfolders = []string{}
-						for _, subfolder2 := range *sourceConfig.SubfoldersFallback {
-							fmtSubfolder2 := subfolder
-							if strings.Contains(subfolder2, "{{") && strings.Contains(subfolder2, "}}") {
-								for _, key := range keys {
-									if strings.Contains(fmtSubfolder, key[0]) {
-										fmtSubfolder2 = strings.ReplaceAll(fmtSubfolder2, key[0], key[1])
-									}
-								}
-								// all other keys ...
-								fmtSubfolder2 = dataKeys_DiscordMessage(subfolder2, download.Message)
-							}
-
-							// Scrub subfolder
-							fmtSubfolder2 = clearSourceField(fmtSubfolder2, sourceConfig)
-
-							subfolders = append(subfolders, fmtSubfolder2)
-						}
-						break
-					} else {
-						subfolders = append(subfolders, fmtSubfolder)
-					}
-				}
+				subfolders := formattedDownloadSubfolders(sourceConfig, download, contentTypeBase)
 
 				// Subfolder Dividion - Handle Formatted Subfolders
 				subpath := ""
@@ -1228,19 +1541,30 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				download.Path = download.Path + subpath // overwrite with new destination path
 			}
 		}
-		completePath := filepath.Clean(download.Path + download.Filename)
+		completePath := filepath.Clean(filepath.Join(download.Path, download.Filename))
+		if !pathIsWithinBase(download.Path, completePath) {
+			return mDownloadStatus(downloadFailedInvalidPath,
+				fmt.Errorf("download filename escapes destination: %q", download.Filename)), 0
+		}
+		mediaPath := tempDownloadPath
+		savedToDisk := false
 
-		// Check if filepath exists
-		if _, err := os.Stat(completePath); err == nil {
+		// Check and write under one lock so concurrent messages cannot overwrite
+		// the same destination after both observe it as missing.
+		downloadWriteMu.Lock()
+		if _, statErr := os.Stat(completePath); statErr == nil {
 			if *sourceConfig.SavePossibleDuplicates {
 				tmpPath := completePath
 				i := 1
 				for {
 					// Append number to name
-					completePath = tmpPath[0:len(tmpPath)-len(filepathExtension(tmpPath))] +
-						"-" + strconv.Itoa(i) + filepathExtension(tmpPath)
-					if _, err := os.Stat(completePath); os.IsNotExist(err) {
+					candidateName := filenameWithSuffix(filepath.Base(tmpPath), "-"+strconv.Itoa(i), 255)
+					completePath = filepath.Join(filepath.Dir(tmpPath), candidateName)
+					if _, candidateErr := os.Stat(completePath); os.IsNotExist(candidateErr) {
 						break
+					} else if candidateErr != nil {
+						downloadWriteMu.Unlock()
+						return mDownloadStatus(downloadFailedWritingFile, candidateErr), 0
 					}
 					i = i + 1
 				}
@@ -1250,21 +1574,33 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 						tmpPath, completePath))
 				}
 			} else {
+				downloadWriteMu.Unlock()
 				if !download.HistoryCmd && !download.EmojiCmd {
 					log.Println(lg("Download", "Skip", color.GreenString,
 						"Matching filenames, possible duplicate..."))
 				}
 				return mDownloadStatus(downloadSkippedDuplicate), 0
 			}
+		} else if !os.IsNotExist(statErr) {
+			downloadWriteMu.Unlock()
+			return mDownloadStatus(downloadFailedWritingFile, statErr), 0
 		}
+		download.Filename = filepath.Base(completePath)
 
 		// Write
 		if *sourceConfig.Save {
-			if err = os.WriteFile(completePath, bodyOfResp, 0644); err != nil {
+			if err = os.Chmod(tempDownloadPath, 0644); err != nil {
+				downloadWriteMu.Unlock()
+				return mDownloadStatus(downloadFailedWritingFile, err), 0
+			}
+			if err = os.Rename(tempDownloadPath, completePath); err != nil {
+				downloadWriteMu.Unlock()
 				log.Println(lg("Download", "", color.HiRedString,
 					"Error while writing file to disk \"%s\": %s", download.InputURL, err))
 				return mDownloadStatus(downloadFailedWritingFile, err), 0
 			}
+			savedToDisk = true
+			mediaPath = completePath
 
 			// Change file time
 			if err = os.Chtimes(completePath, download.FileTime, download.FileTime); err != nil {
@@ -1299,7 +1635,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 					logPrefix+"SAVED %s sent %sin %s\n\t\t\t\t%s",
 					strings.ToUpper(contentTypeBase), msgTimestamp,
 					color.HiYellowString("\"%s / %s\" (%s, %s)", sourceName, sourceChannelName, download.Message.ChannelID, download.Message.ID),
-					color.GreenString("> %s to \"%s%s\"\t\t%s", domain, download.Path, download.Filename,
+					color.GreenString("> %s to \"%s\"\t\t%s", domain, completePath,
 						color.WhiteString("(%s, %s, %0.1f %s)",
 							filesize, timeSinceShort(download.StartTime), speed/time.Since(download.StartTime).Seconds(), speedlabel))))
 			}
@@ -1310,8 +1646,9 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 					contentTypeBase, sourceName, sourceChannelName))
 			}
 		}
+		downloadWriteMu.Unlock()
 
-		userID := botUser.ID
+		userID := discordUserID()
 		if !download.EmojiCmd {
 			if download.Message.Author != nil {
 				userID = download.Message.Author.ID
@@ -1326,31 +1663,27 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 			URL:         download.InputURL,
 			Time:        time.Now(),
 			Destination: completePath,
-			Filename:    download.Filename,
+			Filename:    filepath.Base(completePath),
 			ChannelID:   chID,
 			UserID:      userID,
 		})
 		if err != nil {
+			if savedToDisk {
+				downloadWriteMu.Lock()
+				removeErr := os.Remove(completePath)
+				downloadWriteMu.Unlock()
+				if removeErr != nil && !os.IsNotExist(removeErr) {
+					err = fmt.Errorf("%w (also failed to remove untracked file %q: %v)", err, completePath, removeErr)
+				}
+			}
 			log.Println(lg("Download", "", color.HiRedString, "Error writing to database: %s", err))
 			return mDownloadStatus(downloadFailedWritingDatabase, err), 0
 		}
+		duploCommitted = true
 
 		// React
 		if !download.EmojiCmd {
-			shouldReact := config.ReactWhenDownloaded
-			if sourceConfig.ReactWhenDownloaded != nil {
-				shouldReact = *sourceConfig.ReactWhenDownloaded
-			}
-			if download.HistoryCmd {
-				if !config.ReactWhenDownloadedHistory {
-					shouldReact = false
-				}
-				if sourceConfig.ReactWhenDownloadedHistory != nil {
-					if *sourceConfig.ReactWhenDownloadedHistory {
-						shouldReact = true
-					}
-				}
-			}
+			shouldReact := shouldReactToDownload(download.HistoryCmd, sourceConfig)
 			if download.Message.Author != nil && shouldReact {
 				reaction := defaultReact
 				if sourceConfig.ReactWhenDownloadedEmoji == nil {
@@ -1364,21 +1697,11 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 								"Error fetching guild state for emojis from %s: %s",
 								download.Message.GuildID, err))
 						} else {
-							emojis := guild.Emojis
-							if len(emojis) > 1 {
-								for {
-									rand.New(rand.NewSource((time.Now().UnixNano())))
-									chosenEmoji := emojis[rand.Intn(len(emojis))]
-									formattedEmoji := chosenEmoji.APIName()
-									if !chosenEmoji.Animated && !stringInSlice(formattedEmoji,
-										*sourceConfig.BlacklistReactEmojis) {
-										reaction = formattedEmoji
-										break
-									}
-								}
-							} else {
-								reaction = defaultReact
+							blacklist := []string{}
+							if sourceConfig.BlacklistReactEmojis != nil {
+								blacklist = *sourceConfig.BlacklistReactEmojis
 							}
+							reaction = chooseDownloadReaction(guild.Emojis, blacklist, defaultReact)
 						}
 					} else {
 						reaction = defaultReact
@@ -1426,12 +1749,19 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 						msg = strings.ReplaceAll(msg, "\\n", "\n")
 						// File
 						if actualFile {
+							mediaFile, openErr := os.Open(mediaPath)
+							if openErr != nil {
+								log.Println(lg("Download", "", color.HiRedString,
+									"File log message failed to open local file:\t%s", openErr))
+								continue
+							}
 							_, err := bot.ChannelMessageSendComplex(logChannel,
 								&discordgo.MessageSend{
 									Content: msg,
-									File:    &discordgo.File{Name: download.Filename, Reader: bytes.NewReader(bodyOfResp)},
+									File:    &discordgo.File{Name: download.Filename, Reader: mediaFile},
 								},
 							)
+							mediaFile.Close()
 							if err != nil {
 								log.Println(lg("Download", "", color.HiRedString,
 									"File log message failed to send:\t%s", err))
@@ -1471,15 +1801,15 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 
 		// Update Presence
 		if !download.HistoryCmd {
-			timeLastUpdated = time.Now()
+			setLastUpdated(time.Now())
 			if *sourceConfig.PresenceEnabled {
 				go updateDiscordPresence()
 			}
 		}
 
-		timeLastDownload = time.Now()
+		setLastDownload(time.Now())
 		if *sourceConfig.Save {
-			return mDownloadStatus(downloadSuccess), fileinfo.Size()
+			return mDownloadStatus(downloadSuccess), bytesWritten
 		} else {
 			return mDownloadStatus(downloadSuccess), 0
 		}

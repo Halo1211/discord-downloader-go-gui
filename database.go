@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HouzuoGuo/tiedot/db"
@@ -15,22 +17,108 @@ import (
 	"github.com/rivo/duplo"
 )
 
+var (
+	databaseMu            sync.Mutex
+	databaseDownloadCount atomic.Int64
+	downloadIndexMu       sync.RWMutex
+	downloadIndex         = make(map[string]struct{})
+	duploMu               sync.Mutex
+)
+
+func downloadIndexKey(inputURL, channelID string) string {
+	return channelID + "\x00" + normalizeDownloadURL(inputURL)
+}
+
+func rebuildDownloadIndex() int {
+	index := make(map[string]struct{})
+	count := 0
+	databaseMu.Lock()
+	if myDB != nil && myDB.Use("Downloads") != nil {
+		myDB.Use("Downloads").ForEachDoc(func(_ int, docContent []byte) bool {
+			count++
+			var document map[string]interface{}
+			if json.Unmarshal(docContent, &document) == nil {
+				inputURL := stringValue(document["URL"])
+				channelID := stringValue(document["ChannelID"])
+				if inputURL != "" && channelID != "" {
+					index[downloadIndexKey(inputURL, channelID)] = struct{}{}
+				}
+			}
+			return true
+		})
+	}
+	databaseMu.Unlock()
+
+	downloadIndexMu.Lock()
+	downloadIndex = index
+	downloadIndexMu.Unlock()
+	databaseDownloadCount.Store(int64(count))
+	return count
+}
+
+func dbHasDownload(inputURL, channelID string) bool {
+	downloadIndexMu.RLock()
+	_, exists := downloadIndex[downloadIndexKey(inputURL, channelID)]
+	downloadIndexMu.RUnlock()
+	return exists
+}
+
+func databaseReady() bool {
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	return myDB != nil && myDB.Use("Downloads") != nil
+}
+
+func closeDatabase() {
+	databaseMu.Lock()
+	if myDB != nil {
+		myDB.Close()
+		myDB = nil
+	}
+	databaseMu.Unlock()
+}
+
+func clearDuploCatalog() {
+	duploMu.Lock()
+	duploCatalog = duplo.New()
+	duploMu.Unlock()
+	if err := os.Remove(pathCacheDuplo); err != nil && !os.IsNotExist(err) {
+		log.Println(lg("Duplo", "Reset", color.HiRedString, "Unable to remove stale catalog: %s", err))
+	}
+}
+
+func highestDuploDownloadID() int {
+	highest := 0
+	duploMu.Lock()
+	defer duploMu.Unlock()
+	if duploCatalog == nil {
+		return highest
+	}
+	for _, id := range duploCatalog.IDs() {
+		if numericID, ok := id.(int); ok && numericID > highest {
+			highest = numericID
+		}
+	}
+	return highest
+}
+
 func openDatabase() {
 	var openT time.Time
 	var createT time.Time
 	// Database
 	log.Println(lg("Database", "", color.YellowString, "Opening database...\t(this can take a bit...)"))
 	openT = time.Now()
-	myDB, err = db.OpenDB(pathDatabaseBase)
-	if err != nil {
-		log.Println(lg("Database", "", color.HiRedString, "Unable to open database: %s", err))
+	openedDB, openErr := db.OpenDB(pathDatabaseBase)
+	if openErr != nil {
+		log.Println(lg("Database", "", color.HiRedString, "Unable to open database: %s", openErr))
 		return
 	}
-	if myDB.Use("Downloads") == nil {
+	if openedDB.Use("Downloads") == nil {
 		log.Println(lg("Database", "Setup", color.YellowString, "Creating database, please wait..."))
 		createT = time.Now()
-		if err := myDB.Create("Downloads"); err != nil {
+		if err := openedDB.Create("Downloads"); err != nil {
 			log.Println(lg("Database", "Setup", color.HiRedString, "Error while trying to create database: %s", err))
+			openedDB.Close()
 			return
 		}
 		log.Println(lg("Database", "Setup", color.HiYellowString, "Created new database...\t(took %s)", timeSinceShort(createT)))
@@ -38,7 +126,7 @@ func openDatabase() {
 		log.Println(lg("Database", "Setup", color.YellowString, "Structuring database, please wait..."))
 		createT = time.Now()
 		indexColumn := func(col string) {
-			if err := myDB.Use("Downloads").Index([]string{col}); err != nil {
+			if err := openedDB.Use("Downloads").Index([]string{col}); err != nil {
 				log.Println(lg("Database", "Setup", color.HiRedString, "Unable to create index for %s: %s", col, err))
 				return
 			}
@@ -48,14 +136,20 @@ func openDatabase() {
 		indexColumn("UserID")
 		log.Println(lg("Database", "Setup", color.HiYellowString, "Created database structure...\t(took %s)", timeSinceShort(createT)))
 	}
+	databaseMu.Lock()
+	if myDB != nil && myDB != openedDB {
+		myDB.Close()
+	}
+	myDB = openedDB
+	databaseMu.Unlock()
 	// Cache download tally
-	cachedDownloadID = dbDownloadCount()
-	log.Println(lg("Database", "", color.HiYellowString, "Database opened, contains %d entries...\t(took %s)", cachedDownloadID, timeSinceShort(openT)))
+	downloadCount := rebuildDownloadIndex()
+	log.Println(lg("Database", "", color.HiYellowString, "Database opened, contains %d entries...\t(took %s)", downloadCount, timeSinceShort(openT)))
 
 	// Duplo
-	if config.Duplo || sourceHasDuplo {
+	if configUsesDuplo() {
 		log.Println(lg("Duplo", "", color.HiRedString, "!!! Duplo is barely supported and may cause issues, use at your own risk..."))
-		duploCatalog = duplo.New()
+		loadedCatalog := duplo.New()
 		if _, err := os.Stat(pathCacheDuplo); err == nil {
 			log.Println(lg("Duplo", "", color.YellowString, "Opening duplo image catalog..."))
 			openT = time.Now()
@@ -63,61 +157,132 @@ func openDatabase() {
 			if err != nil {
 				log.Println(lg("Duplo", "", color.HiRedString, "Error opening duplo catalog:\t%s", err))
 			} else {
-				err = duploCatalog.GobDecode(storeFile)
+				err = loadedCatalog.GobDecode(storeFile)
 				if err != nil {
 					log.Println(lg("Duplo", "", color.HiRedString, "Error decoding duplo catalog:\t%s", err))
 				}
-				if duploCatalog != nil {
-					log.Println(lg("Duplo", "", color.HiYellowString, "Duplo catalog opened (%d)\t(took %s)", duploCatalog.Size(), timeSinceShort(openT)))
-				}
+				log.Println(lg("Duplo", "", color.HiYellowString, "Duplo catalog opened (%d)\t(took %s)", loadedCatalog.Size(), timeSinceShort(openT)))
+			}
+		}
+		duploMu.Lock()
+		duploCatalog = loadedCatalog
+		duploMu.Unlock()
+	}
+	// Download attempts can consume IDs without creating database records. Use
+	// the largest persisted Duplo ID as well as the row count to avoid reusing
+	// an existing visual-hash identifier after restart.
+	setCachedDownloadID(max(downloadCount, highestDuploDownloadID()))
+}
+
+func resetDownloadDatabase() error {
+	if historyJobs != nil {
+		for _, pair := range historyJobs.Snapshot() {
+			switch pair.Value.Status {
+			case historyStatusWaiting, historyStatusRunning, historyStatusAbortRequested:
+				return fmt.Errorf("history job %s is still active", pair.Key)
 			}
 		}
 	}
+
+	// Stop and drain real-time work before closing the database. New gateway
+	// events see the stopped manager and are rejected until a fresh manager is
+	// installed after the reset.
+	previousManager := currentDownloadManager()
+	if previousManager != nil {
+		previousManager.stopAndWait()
+	}
+
+	databaseMu.Lock()
+	if myDB != nil {
+		myDB.Close()
+		myDB = nil
+	}
+	removeErr := os.RemoveAll(pathDatabaseBase)
+	databaseMu.Unlock()
+	clearDuploCatalog()
+
+	// Even after a failed deletion, try reopening the existing path so the
+	// runtime is not left with a closed database.
+	openDatabase()
+	if !databaseReady() {
+		if removeErr != nil {
+			return fmt.Errorf("delete database: %w (database reopen also failed)", removeErr)
+		}
+		return fmt.Errorf("database reopen failed")
+	}
+	if previousManager != nil {
+		startDownloadManager(config.DownloadWorkers, config.DownloadQueueSize)
+	}
+	return removeErr
+}
+
+func saveDuploCatalog() error {
+	duploMu.Lock()
+	defer duploMu.Unlock()
+	if duploCatalog == nil {
+		return nil
+	}
+	data, err := duploCatalog.GobEncode()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(pathCacheDuplo), 0755); err != nil {
+		return err
+	}
+	return writeFileAtomic(pathCacheDuplo, data, 0600)
 }
 
 func backupDatabase() error {
 	if err := os.MkdirAll(pathDatabaseBackups, 0755); err != nil {
 		return err
 	}
-	file, err := os.Create(pathDatabaseBackups + string(os.PathSeparator) + time.Now().Format("2006-01-02_15-04-05.000000000") + ".zip")
+	backupPath := filepath.Join(pathDatabaseBackups, time.Now().Format("2006-01-02_15-04-05.000000000")+".zip")
+	file, err := os.Create(backupPath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
 	w := zip.NewWriter(file)
-	defer w.Close()
-
-	err = filepath.Walk(pathDatabaseBase, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	databaseMu.Lock()
+	err = filepath.Walk(pathDatabaseBase, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if info.IsDir() {
 			return nil
 		}
-		file, err := os.Open(path)
+		source, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-
-		// Ensure that `path` is not absolute; it should not start with "/".
-		// This snippet happens to work because I don't use
-		// absolute paths, but ensure your real-world code
-		// transforms path into a zip-root relative path.
-		f, err := w.Create(path)
+		relativePath, err := filepath.Rel(pathDatabaseBase, path)
+		if err != nil {
+			source.Close()
+			return err
+		}
+		destination, err := w.Create(filepath.ToSlash(relativePath))
+		if err == nil {
+			_, err = io.Copy(destination, source)
+		}
+		closeErr := source.Close()
 		if err != nil {
 			return err
 		}
-
-		_, err = io.Copy(f, file)
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return closeErr
 	})
+	databaseMu.Unlock()
 	if err != nil {
+		w.Close()
+		file.Close()
+		os.Remove(backupPath)
+		return err
+	}
+	if err := w.Close(); err != nil {
+		file.Close()
+		os.Remove(backupPath)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(backupPath)
 		return err
 	}
 	return nil
@@ -126,55 +291,131 @@ func backupDatabase() error {
 //#region Database Utility
 
 func dbInsertDownload(download *downloadItem) error {
+	if download == nil {
+		return fmt.Errorf("download record is nil")
+	}
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	if myDB == nil || myDB.Use("Downloads") == nil {
+		return fmt.Errorf("downloads database is not open")
+	}
 	_, err := myDB.Use("Downloads").Insert(map[string]interface{}{
-		"URL":         download.URL,
+		"URL":         normalizeDownloadURL(download.URL),
 		"Time":        download.Time.String(),
 		"Destination": download.Destination,
 		"Filename":    download.Filename,
 		"ChannelID":   download.ChannelID,
 		"UserID":      download.UserID,
 	})
+	if err == nil {
+		downloadIndexMu.Lock()
+		downloadIndex[downloadIndexKey(download.URL, download.ChannelID)] = struct{}{}
+		downloadIndexMu.Unlock()
+		databaseDownloadCount.Add(1)
+	}
 	return err
 }
 
 func dbFindDownloadByID(id int) *downloadItem {
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	return dbFindDownloadByIDLocked(id)
+}
+
+func dbFindDownloadByIDLocked(id int) *downloadItem {
+	if myDB == nil {
+		return nil
+	}
 	downloads := myDB.Use("Downloads")
+	if downloads == nil {
+		return nil
+	}
 	readBack, err := downloads.Read(id)
 	if err != nil {
 		log.Println(lg("Database", "Downloads", color.HiRedString, "Failed to read database:\t%s", err))
+		return nil
 	}
-	timeT, _ := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", readBack["Time"].(string))
+	timeString, ok := readBack["Time"].(string)
+	if !ok {
+		return nil
+	}
+	timeT, _ := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", timeString)
 	return &downloadItem{
-		URL:         readBack["URL"].(string),
+		URL:         stringValue(readBack["URL"]),
 		Time:        timeT,
-		Destination: readBack["Destination"].(string),
-		Filename:    readBack["Filename"].(string),
-		ChannelID:   readBack["ChannelID"].(string),
-		UserID:      readBack["UserID"].(string),
+		Destination: stringValue(readBack["Destination"]),
+		Filename:    stringValue(readBack["Filename"]),
+		ChannelID:   stringValue(readBack["ChannelID"]),
+		UserID:      stringValue(readBack["UserID"]),
 	}
 }
 
+func stringValue(value interface{}) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return ""
+}
+
 func dbFindDownloadByURL(inputURL string) []*downloadItem {
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	if myDB == nil || myDB.Use("Downloads") == nil {
+		return nil
+	}
+	encodedURL, _ := json.Marshal(normalizeDownloadURL(inputURL))
 	var query interface{}
-	json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": "%s", "in": ["URL"]}]`, inputURL)), &query)
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": %s, "in": ["URL"]}]`, encodedURL)), &query); err != nil {
+		return nil
+	}
 	queryResult := make(map[int]struct{})
-	db.EvalQuery(query, myDB.Use("Downloads"), &queryResult)
+	if err := db.EvalQuery(query, myDB.Use("Downloads"), &queryResult); err != nil {
+		log.Println(lg("Database", "Downloads", color.HiRedString, "Failed to query database:\t%s", err))
+		return nil
+	}
 
 	downloadedImages := make([]*downloadItem, 0)
 	for id := range queryResult {
-		downloadedImages = append(downloadedImages, dbFindDownloadByID(id))
+		if download := dbFindDownloadByIDLocked(id); download != nil {
+			downloadedImages = append(downloadedImages, download)
+		}
 	}
 	return downloadedImages
 }
 
 func dbDeleteByChannelID(channelID string) {
-	var query interface{}
-	json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": "%s", "in": ["ChannelID"]}]`, channelID)), &query)
-	queryResult := make(map[int]struct{})
-	db.EvalQuery(query, myDB.Use("Downloads"), &queryResult)
-	for id := range queryResult {
-		myDB.Use("Downloads").Delete(id)
+	databaseMu.Lock()
+	if myDB == nil || myDB.Use("Downloads") == nil {
+		databaseMu.Unlock()
+		return
 	}
+	encodedChannelID, _ := json.Marshal(channelID)
+	var query interface{}
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": %s, "in": ["ChannelID"]}]`, encodedChannelID)), &query); err != nil {
+		databaseMu.Unlock()
+		return
+	}
+	queryResult := make(map[int]struct{})
+	if err := db.EvalQuery(query, myDB.Use("Downloads"), &queryResult); err != nil {
+		databaseMu.Unlock()
+		log.Println(lg("Database", "Downloads", color.HiRedString, "Failed to query database:\t%s", err))
+		return
+	}
+	for id := range queryResult {
+		if err := myDB.Use("Downloads").Delete(id); err != nil {
+			log.Println(lg("Database", "Downloads", color.HiRedString, "Failed to delete database entry %d:\t%s", id, err))
+		}
+	}
+	databaseMu.Unlock()
+	if len(queryResult) > 0 {
+		// Duplo IDs are not tied to database document IDs, so selectively
+		// removing only this channel is not reliable. Clearing the catalog is
+		// safer than retaining hashes for records the user explicitly deleted.
+		clearDuploCatalog()
+	}
+	// Rebuild from the database so failed/partial deletes cannot desynchronise
+	// the in-memory URL index or cached count.
+	rebuildDownloadIndex()
 }
 
 //#endregion
@@ -182,6 +423,11 @@ func dbDeleteByChannelID(channelID string) {
 //#region Statistics
 
 func dbDownloadCount() int {
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	if myDB == nil || myDB.Use("Downloads") == nil {
+		return 0
+	}
 	i := 0
 	myDB.Use("Downloads").ForEachDoc(func(id int, docContent []byte) (willMoveOn bool) {
 		i++
@@ -191,16 +437,25 @@ func dbDownloadCount() int {
 }
 
 func dbDownloadCountByChannel(channelID string) int {
-	var query interface{}
-	json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": "%s", "in": ["ChannelID"]}]`, channelID)), &query)
-	queryResult := make(map[int]struct{})
-	db.EvalQuery(query, myDB.Use("Downloads"), &queryResult)
-
-	downloadedImages := make([]*downloadItem, 0)
-	for id := range queryResult {
-		downloadedImages = append(downloadedImages, dbFindDownloadByID(id))
+	databaseMu.Lock()
+	defer databaseMu.Unlock()
+	if myDB == nil || myDB.Use("Downloads") == nil {
+		return 0
 	}
-	return len(downloadedImages)
+	encodedChannelID, _ := json.Marshal(channelID)
+	var query interface{}
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`[{"eq": %s, "in": ["ChannelID"]}]`, encodedChannelID)), &query); err != nil {
+		return 0
+	}
+	queryResult := make(map[int]struct{})
+	if err := db.EvalQuery(query, myDB.Use("Downloads"), &queryResult); err != nil {
+		return 0
+	}
+	return len(queryResult)
+}
+
+func dbCachedDownloadCount() int64 {
+	return databaseDownloadCount.Load()
 }
 
 //#endregion
