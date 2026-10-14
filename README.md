@@ -109,7 +109,7 @@ options include `--gui-address=127.0.0.1:8899`, `--no-gui-open`, `--no-tray`,
 - [History Guide](docs/HISTORY.md) — archive scans, checkpoints, cancellation, and recovery.
 - [Wiki hub](wiki/Home.md) — the complete guide set, including examples and troubleshooting.
 - [Architecture Map](ARCHITECTURE.md) — runtime flow, state boundaries, and persistence.
-- [Release Notes](RELEASE_NOTES.md) — changes planned for v1.0.1 and previous releases.
+- [Release Notes](RELEASE_NOTES.md) — changes in v1.0.1 and previous releases.
 
 ## Reliability and security defaults
 

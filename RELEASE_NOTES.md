@@ -1,6 +1,6 @@
 # Release Notes
 
-## v1.0.1 (pending release)
+## v1.0.1
 
 This maintenance update improves download, history, configuration, and GUI
 behavior. It also adds regression coverage for the bugs fixed since v1.0.0.
