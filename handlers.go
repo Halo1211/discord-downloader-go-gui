@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +14,67 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/fatih/color"
 )
+
+// A blocked value always wins. Every configured allow-list is an independent
+// requirement, so matching one cannot bypass another list or a block rule.
+func messageFilterAllows(m *discordgo.Message, filters *configurationSourceFilters) bool {
+	if filters == nil {
+		return true
+	}
+	if filters.BlockedPhrases != nil {
+		for _, phrase := range *filters.BlockedPhrases {
+			if phrase != "" && strings.Contains(m.Content, phrase) {
+				return false
+			}
+		}
+	}
+	if filters.BlockedUsers != nil && stringInSlice(m.Author.ID, *filters.BlockedUsers) {
+		return false
+	}
+	if filters.AllowedPhrases != nil {
+		matched := false
+		for _, phrase := range *filters.AllowedPhrases {
+			if phrase != "" && strings.Contains(m.Content, phrase) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if filters.AllowedUsers != nil && !stringInSlice(m.Author.ID, *filters.AllowedUsers) {
+		return false
+	}
+	if filters.BlockedRoles == nil && filters.AllowedRoles == nil {
+		return true
+	}
+	member := m.Member
+	if member == nil && m.GuildID != "" {
+		if session := currentDiscordSession(); session != nil {
+			member, _ = session.GuildMember(m.GuildID, m.Author.ID)
+		}
+	}
+	if member == nil {
+		return false
+	}
+	if filters.BlockedRoles != nil {
+		for _, role := range member.Roles {
+			if stringInSlice(role, *filters.BlockedRoles) {
+				return false
+			}
+		}
+	}
+	if filters.AllowedRoles != nil {
+		for _, role := range member.Roles {
+			if stringInSlice(role, *filters.AllowedRoles) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
 
 //#region Events
 
@@ -26,8 +89,12 @@ func appendSourceLogLine(path, line string, filterDuplicates, enabled bool) (boo
 	sourceLogMu.Lock()
 	defer sourceLogMu.Unlock()
 	if filterDuplicates {
-		if contents, err := os.ReadFile(path); err == nil && strings.Contains(string(contents), line) {
-			return false, nil
+		if contents, err := os.ReadFile(path); err == nil {
+			// Records start with a newline. Include the next boundary so a
+			// shorter message cannot match the prefix of a different record.
+			if strings.Contains(string(contents)+"\n", line+"\n") {
+				return false, nil
+			}
 		}
 	}
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
@@ -75,7 +142,7 @@ func (d *messageEventDeduper) first(event, messageID string) bool {
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m == nil {
+	if m == nil || m.Message == nil {
 		return
 	}
 	if messageEvents.first("create", m.ID) {
@@ -84,20 +151,34 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
-	if m == nil {
+	if m == nil || m.Message == nil {
 		return
 	}
-	if messageEvents.first("update", m.ID) {
-		if m.EditedTimestamp != nil {
-			handleMessage(m.Message, nil, true, false)
-		}
+	// Discord can send several edits, including delayed embed updates, for
+	// the same message. Suppress only identical payloads.
+	payload, err := json.Marshal(m.Message)
+	if err != nil {
+		return
+	}
+	if messageEvents.first(fmt.Sprintf("update:%x", sha256.Sum256(payload)), m.ID) {
+		handleMessage(m.Message, nil, true, false)
 	}
 }
 
 func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, history bool) []downloadedItem {
+	items, _ := handleMessageResult(m, c, edited, history)
+	return items
+}
+
+// A history page is covered only when every attempted download has finished
+// without failure. Keep this signal separate from the successful-file tally.
+func handleMessageResult(m *discordgo.Message, c *discordgo.Channel, edited bool, history bool) (items []downloadedItem, complete bool) {
+	complete = true
 	if m == nil {
-		return nil
+		return nil, true
 	}
+	messageCopy := *m
+	m = &messageCopy
 	if m.Author == nil {
 		m.Author = &discordgo.User{}
 	}
@@ -115,7 +196,7 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 
 	// Admin Channel
 	if isAdminChannelRegistered(m.ChannelID) {
-		m = fixMessage(m)
+		m = fixMessage(m, !edited && !history)
 
 		// Log
 		sendLabel := fmt.Sprintf("%s in \"%s\"#%s",
@@ -152,10 +233,10 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				log.Println(lg("Debug", "Message", color.YellowString,
 					"%s Ignoring message due to %s...", color.HiMagentaString("(CONFIG)"), shouldBailReason))
 			}
-			return nil
+			return nil, true
 		}
 
-		m = fixMessage(m)
+		m = fixMessage(m, !edited && !history)
 
 		// Log
 		if config.MessageOutput {
@@ -252,7 +333,7 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 						logPath, pathErr := safePathUnderBase(savePath, filename)
 						if pathErr != nil {
 							log.Println(lg("LogMessages", "", color.HiRedString, "Invalid log filename: %s", pathErr))
-							return nil
+							return nil, true
 						}
 
 						// Prepend
@@ -272,8 +353,10 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 						// New Line
 						var newLine string
 						msgContent := m.Content
-						if contentFmt, err := m.ContentWithMoreMentionsReplaced(bot); err == nil {
-							msgContent = contentFmt
+						if session := currentDiscordSession(); session != nil {
+							if contentFmt, err := m.ContentWithMoreMentionsReplaced(session); err == nil {
+								msgContent = contentFmt
+							}
 						}
 						lineContent := msgContent
 						if sourceConfig.LogMessages.LineContent != nil {
@@ -299,116 +382,11 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 		}
 
 		// Filters
-		if sourceConfig.Filters != nil {
-			shouldAbort := false
-
-			if sourceConfig.Filters.AllowedPhrases != nil ||
-				sourceConfig.Filters.AllowedUsers != nil ||
-				sourceConfig.Filters.AllowedRoles != nil {
-				shouldAbort = true
-				if config.Debug {
-					log.Println(lg("Debug", "Message", color.YellowString,
-						"%s Filter will be ignoring by default...",
-						color.HiMagentaString("(FILTER)")))
-				}
+		if !messageFilterAllows(m, sourceConfig.Filters) {
+			if config.Debug {
+				log.Println(lg("Debug", "Message", color.YellowString, "Message rejected by source filters"))
 			}
-
-			if sourceConfig.Filters.BlockedPhrases != nil {
-				for _, phrase := range *sourceConfig.Filters.BlockedPhrases {
-					if strings.Contains(m.Content, phrase) && phrase != "" {
-						shouldAbort = true
-						if config.Debug {
-							log.Println(lg("Debug", "Message", color.YellowString,
-								"%s blockedPhrases found \"%s\" in message, planning to abort...",
-								color.HiMagentaString("(FILTER)"), phrase))
-						}
-						break
-					}
-				}
-			}
-			if sourceConfig.Filters.AllowedPhrases != nil {
-				for _, phrase := range *sourceConfig.Filters.AllowedPhrases {
-					if strings.Contains(m.Content, phrase) && phrase != "" {
-						shouldAbort = false
-						if config.Debug {
-							log.Println(lg("Debug", "Message", color.YellowString,
-								"%s allowedPhrases found \"%s\" in message, planning to process...",
-								color.HiMagentaString("(FILTER)"), phrase))
-						}
-						break
-					}
-				}
-			}
-
-			if sourceConfig.Filters.BlockedUsers != nil {
-				if stringInSlice(m.Author.ID, *sourceConfig.Filters.BlockedUsers) {
-					shouldAbort = true
-					if config.Debug {
-						log.Println(lg("Debug", "Message", color.YellowString,
-							"%s blockedUsers caught %s, planning to abort...",
-							color.HiMagentaString("(FILTER)"), m.Author.ID))
-					}
-				}
-			}
-			if sourceConfig.Filters.AllowedUsers != nil {
-				if stringInSlice(m.Author.ID, *sourceConfig.Filters.AllowedUsers) {
-					shouldAbort = false
-					if config.Debug {
-						log.Println(lg("Debug", "Message", color.YellowString,
-							"%s allowedUsers caught %s, planning to process...",
-							color.HiMagentaString("(FILTER)"), m.Author.ID))
-					}
-				}
-			}
-
-			if sourceConfig.Filters.BlockedRoles != nil {
-				member := m.Member
-				if member == nil {
-					member, _ = bot.GuildMember(m.GuildID, m.Author.ID)
-				}
-				if member != nil {
-					for _, role := range member.Roles {
-						if stringInSlice(role, *sourceConfig.Filters.BlockedRoles) {
-							shouldAbort = true
-							if config.Debug {
-								log.Println(lg("Debug", "Message", color.YellowString,
-									"%s blockedRoles caught %s, planning to abort...",
-									color.HiMagentaString("(FILTER)"), role))
-							}
-							break
-						}
-					}
-				}
-			}
-			if sourceConfig.Filters.AllowedRoles != nil {
-				member := m.Member
-				if member == nil {
-					member, _ = bot.GuildMember(m.GuildID, m.Author.ID)
-				}
-				if member != nil {
-					for _, role := range member.Roles {
-						if stringInSlice(role, *sourceConfig.Filters.AllowedRoles) {
-							shouldAbort = false
-							if config.Debug {
-								log.Println(lg("Debug", "Message", color.YellowString,
-									"%s allowedRoles caught %s, planning to allow...",
-									color.HiMagentaString("(FILTER)"), role))
-							}
-							break
-						}
-					}
-				}
-			}
-
-			// Abort
-			if shouldAbort {
-				if config.Debug {
-					log.Println(lg("Debug", "Message", color.YellowString,
-						"%s Filter decided to ignore message...",
-						color.HiMagentaString("(FILTER)")))
-				}
-				return nil
-			}
+			return nil, true
 		}
 
 		// Delays
@@ -427,12 +405,22 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				log.Println(lg("Debug", "Message", color.YellowString, "Delaying for %d milliseconds...", delay))
 			}
 			if waitForRuntimeStop(safeConfiguredDuration(delay, time.Millisecond)) {
-				return nil
+				return nil, false
 			}
 		}
 
 		// Process Collected Links
 		var downloadedItems []downloadedItem
+		if history {
+			for _, raw := range getRawLinks(m) {
+				if !instagramConnected.Load() && (regexUrlInstagram.MatchString(raw.Link) || regexUrlInstagramReel.MatchString(raw.Link) || regexUrlInstagramTV.MatchString(raw.Link)) {
+					complete = false
+				}
+				if !twitterConnected.Load() && regexUrlTwitterStatus.MatchString(raw.Link) {
+					complete = false
+				}
+			}
+		}
 		files := getLinksByMessage(m)
 		for _, file := range files {
 			// Blank link?
@@ -476,6 +464,9 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				continue
 			}
 			status, filesize := runHistoryDownload(request)
+			if status.Status >= downloadFailed {
+				complete = false
+			}
 			// Await Status
 			if status.Status == downloadSuccess {
 				domain, _ := getDomain(file.Link)
@@ -486,10 +477,10 @@ func handleMessage(m *discordgo.Message, c *discordgo.Channel, edited bool, hist
 				})
 			}
 		}
-		return downloadedItems
+		return downloadedItems, complete
 	}
 
-	return nil
+	return nil, true
 }
 
 //#endregion

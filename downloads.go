@@ -359,9 +359,6 @@ func pruneCompletedLinks(linkList map[string]string, m *discordgo.Message) map[s
 	for link, filename := range linkList {
 		testLink := normalizeDownloadURL(link)
 		alreadyDownloaded := dbHasDownload(testLink, m.ChannelID)
-		if !alreadyDownloaded && downloadIsInFlight(testLink, m.ChannelID) {
-			alreadyDownloaded = true
-		}
 
 		savePossibleDuplicates := false
 		if sourceConfig.SavePossibleDuplicates != nil {
@@ -383,13 +380,11 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 		return links
 	}
 
-	// Fix source author if nil
-	if m.Author == nil {
-		m.Author = new(discordgo.User)
-	}
-
 	// Search Discord File Attachments
 	for _, attachment := range m.Attachments {
+		if attachment == nil {
+			continue
+		}
 		links = append(links, &fileItem{
 			Link:         attachment.URL,
 			Filename:     attachment.Filename,
@@ -399,6 +394,9 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 
 	// Search Discord Embedded Content
 	for _, embed := range m.Embeds {
+		if embed == nil {
+			continue
+		}
 		if embed.URL != "" {
 			links = append(links, &fileItem{
 				Link: embed.URL,
@@ -436,6 +434,9 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 		}
 		// Attachments
 		for _, attachment := range snapshot.Message.Attachments {
+			if attachment == nil {
+				continue
+			}
 			links = append(links, &fileItem{
 				Link:         attachment.URL,
 				Filename:     attachment.Filename,
@@ -444,6 +445,9 @@ func getRawLinks(m *discordgo.Message) []*fileItem {
 		}
 		// Embeds
 		for _, embed := range snapshot.Message.Embeds {
+			if embed == nil {
+				continue
+			}
 			if embed.URL != "" {
 				links = append(links, &fileItem{
 					Link: embed.URL,
@@ -496,13 +500,17 @@ func getParsedLinks(inputURL string, m *discordgo.Message) map[string]string {
 	*/
 
 	// Twitter / X
-	inputURL = strings.ReplaceAll(inputURL, "mobile.twitter", "twitter")
-	inputURL = strings.ReplaceAll(inputURL, "fxtwitter.com", "twitter.com")
-	inputURL = strings.ReplaceAll(inputURL, "c.vxtwitter.com", "twitter.com")
-	inputURL = strings.ReplaceAll(inputURL, "vxtwitter.com", "twitter.com")
-	inputURL = strings.ReplaceAll(inputURL, "//x.com", "//twitter.com")
-	inputURL = strings.ReplaceAll(inputURL, ".x.com", ".twitter.com")
-	inputURL = strings.ReplaceAll(inputURL, "𝕏", "x")
+	if parsed, err := url.Parse(inputURL); err == nil {
+		switch strings.ToLower(parsed.Hostname()) {
+		case "mobile.twitter.com", "fxtwitter.com", "c.vxtwitter.com", "vxtwitter.com", "x.com", "www.x.com":
+			port := parsed.Port()
+			parsed.Host = "twitter.com"
+			if port != "" {
+				parsed.Host = net.JoinHostPort("twitter.com", port)
+			}
+			inputURL = parsed.String()
+		}
+	}
 	// Direct Twitter CDN media does not require an authenticated scraper.
 	if regexUrlTwitter.MatchString(inputURL) {
 		links, err := getTwitterUrls(inputURL)
@@ -512,7 +520,7 @@ func getParsedLinks(inputURL string, m *discordgo.Message) map[string]string {
 			return pruneCompletedLinks(links, m)
 		}
 	}
-	if twitterConnected && regexUrlTwitterStatus.MatchString(inputURL) {
+	if twitterConnected.Load() && regexUrlTwitterStatus.MatchString(inputURL) {
 		links, err := getTwitterStatusUrls(inputURL, m)
 		if err != nil {
 			if !strings.Contains(err.Error(), "suspended") && !strings.Contains(err.Error(), "No status found") {
@@ -528,7 +536,7 @@ func getParsedLinks(inputURL string, m *discordgo.Message) map[string]string {
 
 	// Instagram
 	if regexUrlInstagram.MatchString(inputURL) || regexUrlInstagramReel.MatchString(inputURL) || regexUrlInstagramTV.MatchString(inputURL) {
-		if !instagramConnected {
+		if !instagramConnected.Load() {
 			return map[string]string{}
 		}
 		links, err := getInstagramUrls(inputURL, m)
@@ -661,6 +669,9 @@ func getParsedLinks(inputURL string, m *discordgo.Message) map[string]string {
 
 func getLinksByMessage(m *discordgo.Message) []*fileItem {
 	var fileItems []*fileItem
+	if m == nil {
+		return fileItems
+	}
 
 	linkTime := m.Timestamp
 
@@ -709,6 +720,9 @@ func getLinksByMessage(m *discordgo.Message) []*fileItem {
 
 	// Scrape Stickers from message
 	for _, sticker := range m.StickerItems {
+		if sticker == nil {
+			continue
+		}
 		fileItems = append(fileItems, &fileItem{
 			Link:         "https://media.discordapp.net/stickers/" + sticker.ID + ".png",
 			Filename:     "Sticker " + sticker.Name,
@@ -914,18 +928,19 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 					content += fmt.Sprintf("\n```ERROR: %s```", status.Error)
 				}
 				// Failure Notice
-				if !hasPerms(download.Message.ChannelID, discordgo.PermissionSendMessages) {
+				session := currentDiscordSession()
+				if session == nil || !hasPerms(download.Message.ChannelID, discordgo.PermissionSendMessages) {
 					log.Println(lg("Download", "", color.HiRedString, fmtBotSendPerm, download.Message.ChannelID))
 				} else {
 					if selfbot {
-						_, err := bot.ChannelMessageSend(download.Message.ChannelID,
+						_, err := session.ChannelMessageSend(download.Message.ChannelID,
 							fmt.Sprintf("%s **Download Failure**\n\n%s", download.Message.Author.Mention(), content))
 						if err != nil {
 							log.Println(lg("Download", "", color.HiRedString,
 								"Failed to send failure message to %s: %s", download.Message.ChannelID, err))
 						}
 					} else {
-						if _, err := bot.ChannelMessageSendComplex(download.Message.ChannelID,
+						if _, err := session.ChannelMessageSendComplex(download.Message.ChannelID,
 							&discordgo.MessageSend{
 								Content: fmt.Sprintf("<@!%s>", download.Message.Author.ID),
 								Embed:   buildEmbed(download.Message.ChannelID, "Download Failure", content),
@@ -1051,17 +1066,20 @@ func (download downloadRequestStruct) handleDownload() (downloadStatusStruct, in
 							}
 							// Message content
 							msgContent := download.Message.Content
-							if contentFmt, err := download.Message.ContentWithMoreMentionsReplaced(bot); err == nil {
-								msgContent = contentFmt
+							if session := currentDiscordSession(); session != nil {
+								if contentFmt, err := download.Message.ContentWithMoreMentionsReplaced(session); err == nil {
+									msgContent = contentFmt
+								}
 							}
 							keys := [][]string{
 								{"{{link}}", download.InputURL},
 								{"{{msgContent}}", msgContent},
 							}
-							if len(download.Message.Embeds) > 0 {
-								keys = append(keys, [][]string{
-									{"{{embedDesc}}", download.Message.Embeds[0].Description},
-								}...)
+							for _, embed := range download.Message.Embeds {
+								if embed != nil {
+									keys = append(keys, []string{"{{embedDesc}}", embed.Description})
+									break
+								}
 							}
 							for _, key := range keys {
 								if strings.Contains(lineContent, key[0]) {
@@ -1289,9 +1307,6 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		// Check Filename
 		if sourceConfig.Filters.AllowedFilenames != nil || sourceConfig.Filters.BlockedFilenames != nil {
 			shouldAbort := false
-			if sourceConfig.Filters.AllowedFilenames != nil {
-				shouldAbort = true
-			}
 
 			if sourceConfig.Filters.BlockedFilenames != nil {
 				for _, phrase := range *sourceConfig.Filters.BlockedFilenames {
@@ -1301,11 +1316,13 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				}
 			}
 			if sourceConfig.Filters.AllowedFilenames != nil {
+				allowed := false
 				for _, phrase := range *sourceConfig.Filters.AllowedFilenames {
 					if phrase != "" && phrase != " " && strings.Contains(download.Filename, phrase) {
-						shouldAbort = false
+						allowed = true
 					}
 				}
+				shouldAbort = shouldAbort || !allowed
 			}
 
 			// Abort
@@ -1322,12 +1339,13 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		if download.Message != nil &&
 			(sourceConfig.Filters.AllowedReactions != nil || sourceConfig.Filters.BlockedReactions != nil) {
 			shouldAbort := false
-			if sourceConfig.Filters.AllowedReactions != nil {
-				shouldAbort = true
-			}
+			allowed := sourceConfig.Filters.AllowedReactions == nil
 
 			if download.Message.Reactions != nil {
 				for _, reaction := range download.Message.Reactions {
+					if reaction == nil || reaction.Emoji == nil {
+						continue
+					}
 					if sourceConfig.Filters.BlockedReactions != nil {
 						if stringInSlice(reaction.Emoji.ID, *sourceConfig.Filters.BlockedReactions) ||
 							stringInSlice(reaction.Emoji.Name, *sourceConfig.Filters.BlockedReactions) {
@@ -1337,11 +1355,12 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 					if sourceConfig.Filters.AllowedReactions != nil {
 						if stringInSlice(reaction.Emoji.ID, *sourceConfig.Filters.AllowedReactions) ||
 							stringInSlice(reaction.Emoji.Name, *sourceConfig.Filters.AllowedReactions) {
-							shouldAbort = false
+							allowed = true
 						}
 					}
 				}
 			}
+			shouldAbort = shouldAbort || !allowed
 
 			// Abort
 			if shouldAbort {
@@ -1395,9 +1414,6 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		// Check extension
 		if sourceConfig.Filters.AllowedExtensions != nil || sourceConfig.Filters.BlockedExtensions != nil {
 			shouldAbort := false
-			if sourceConfig.Filters.AllowedExtensions != nil {
-				shouldAbort = true
-			}
 
 			if sourceConfig.Filters.BlockedExtensions != nil {
 				if stringInSlice(download.Extension, *sourceConfig.Filters.BlockedExtensions) {
@@ -1405,9 +1421,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				}
 			}
 			if sourceConfig.Filters.AllowedExtensions != nil {
-				if stringInSlice(download.Extension, *sourceConfig.Filters.AllowedExtensions) {
-					shouldAbort = false
-				}
+				shouldAbort = shouldAbort || !stringInSlice(download.Extension, *sourceConfig.Filters.AllowedExtensions)
 			}
 
 			// Abort
@@ -1448,6 +1462,10 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		if sourceConfig.Duplo != nil {
 			duploEnabled = *sourceConfig.Duplo
 		}
+		duploThreshold := config.DuploThreshold
+		if sourceConfig.DuploThreshold != nil {
+			duploThreshold = *sourceConfig.DuploThreshold
+		}
 		if duploEnabled && contentTypeBase == "image" && download.Extension != ".gif" && download.Extension != ".webp" {
 			imageFile, openErr := os.Open(tempDownloadPath)
 			if openErr != nil {
@@ -1469,7 +1487,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 					matches := duploCatalog.Query(hash)
 					sort.Sort(matches)
 					for _, match := range matches {
-						if match.Score < config.DuploThreshold {
+						if match.Score < duploThreshold {
 							log.Println(lg("Duplo", "Download", color.GreenString,
 								"Duplicate detected (Score of %f) found at %s", match.Score, download.InputURL))
 							return true
@@ -1489,10 +1507,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		sourceChannelName := "UNKNOWN"
 		if !download.EmojiCmd {
 			// Names
-			sourceChannel, err := bot.State.Channel(download.Message.ChannelID)
-			if err != nil {
-				sourceChannel, _ = bot.Channel(download.Message.ChannelID)
-			}
+			sourceChannel, _ := getChannel(download.Message.ChannelID)
 			sourceChannelName = download.Message.ChannelID
 			if sourceChannel != nil {
 				// Channel Naming
@@ -1507,10 +1522,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				default:
 					// Server Naming
 					if sourceChannel.GuildID != "" {
-						sourceGuild, err := bot.State.Guild(sourceChannel.GuildID)
-						if err != nil {
-							sourceGuild, _ = bot.Guild(sourceChannel.GuildID)
-						}
+						sourceGuild, _ := getServer(sourceChannel.GuildID)
 						if sourceGuild != nil {
 							if sourceGuild.Name != "" {
 								sourceName = sourceGuild.Name
@@ -1646,8 +1658,6 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 					contentTypeBase, sourceName, sourceChannelName))
 			}
 		}
-		downloadWriteMu.Unlock()
-
 		userID := discordUserID()
 		if !download.EmojiCmd {
 			if download.Message.Author != nil {
@@ -1669,16 +1679,16 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 		})
 		if err != nil {
 			if savedToDisk {
-				downloadWriteMu.Lock()
 				removeErr := os.Remove(completePath)
-				downloadWriteMu.Unlock()
 				if removeErr != nil && !os.IsNotExist(removeErr) {
 					err = fmt.Errorf("%w (also failed to remove untracked file %q: %v)", err, completePath, removeErr)
 				}
 			}
+			downloadWriteMu.Unlock()
 			log.Println(lg("Download", "", color.HiRedString, "Error writing to database: %s", err))
 			return mDownloadStatus(downloadFailedWritingDatabase, err), 0
 		}
+		downloadWriteMu.Unlock()
 		duploCommitted = true
 
 		// React
@@ -1688,15 +1698,12 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				reaction := defaultReact
 				if sourceConfig.ReactWhenDownloadedEmoji == nil {
 					if download.Message.GuildID != "" {
-						guild, err := bot.State.Guild(download.Message.GuildID)
-						if err != nil {
-							guild, err = bot.Guild(download.Message.GuildID)
-						}
+						guild, err := getServer(download.Message.GuildID)
 						if err != nil {
 							log.Println(lg("Download", "", color.RedString,
 								"Error fetching guild state for emojis from %s: %s",
 								download.Message.GuildID, err))
-						} else {
+						} else if guild != nil {
 							blacklist := []string{}
 							if sourceConfig.BlacklistReactEmojis != nil {
 								blacklist = *sourceConfig.BlacklistReactEmojis
@@ -1711,7 +1718,10 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 				}
 				// Add Reaction
 				if hasPerms(download.Message.ChannelID, discordgo.PermissionAddReactions) {
-					if err = bot.MessageReactionAdd(download.Message.ChannelID, download.Message.ID, reaction); err != nil {
+					if session := currentDiscordSession(); session != nil {
+						err = session.MessageReactionAdd(download.Message.ChannelID, download.Message.ID, reaction)
+					}
+					if err != nil {
 						log.Println(lg("Download", "", color.RedString,
 							"Error adding reaction to message: %s", err))
 					}
@@ -1735,7 +1745,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 			}
 			for _, logChannel := range logMediaChannels {
 				if logChannel != "" {
-					if hasPerms(logChannel, discordgo.PermissionSendMessages) {
+					if session := currentDiscordSession(); session != nil && hasPerms(logChannel, discordgo.PermissionSendMessages) {
 						actualFile := false
 						if sourceConfig.SendFileDirectly != nil {
 							actualFile = *sourceConfig.SendFileDirectly
@@ -1755,7 +1765,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 									"File log message failed to open local file:\t%s", openErr))
 								continue
 							}
-							_, err := bot.ChannelMessageSendComplex(logChannel,
+							_, err := session.ChannelMessageSendComplex(logChannel,
 								&discordgo.MessageSend{
 									Content: msg,
 									File:    &discordgo.File{Name: download.Filename, Reader: mediaFile},
@@ -1783,7 +1793,7 @@ func (download downloadRequestStruct) tryDownload() (downloadStatusStruct, int64
 								embed.Description = fmt.Sprintf("Unsupported filetype: %s\n%s",
 									contentTypeBase, download.InputURL)
 							}
-							_, err := bot.ChannelMessageSendComplex(logChannel,
+							_, err := session.ChannelMessageSendComplex(logChannel,
 								&discordgo.MessageSend{
 									Content: msg,
 									Embed:   embed,

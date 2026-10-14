@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -152,9 +153,18 @@ func validateLocalGUIAddress(address string) error {
 	if address == "" {
 		return errors.New("GUI address cannot be empty")
 	}
-	host, _, err := net.SplitHostPort(address)
+	host, portText, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("GUI address must use host:port format: %w", err)
+	}
+	for _, digit := range portText {
+		if digit < '0' || digit > '9' {
+			return errors.New("GUI address must use a numeric port between 0 and 65535")
+		}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 0 || port > 65535 {
+		return errors.New("GUI address must use a numeric port between 0 and 65535")
 	}
 	if strings.EqualFold(host, "localhost") {
 		return nil
@@ -341,6 +351,9 @@ func guiStatusHandler(w http.ResponseWriter, r *http.Request) {
 		guiMethodNotAllowed(w, http.MethodGet)
 		return
 	}
+	// Manual Start reloads settings while the dashboard continues polling.
+	configFileMu.Lock()
+	defer configFileMu.Unlock()
 	workers, queued, inFlight, queueStopped := 0, 0, 0, true
 	if manager := currentDownloadManager(); manager != nil {
 		workers, queued, inFlight, queueStopped = manager.stats()
@@ -355,7 +368,7 @@ func guiStatusHandler(w http.ResponseWriter, r *http.Request) {
 				waiting++
 			case job.Status == historyStatusRunning || job.Status == historyStatusAbortRequested:
 				running++
-			case job.Status == historyStatusErrorReadMessageHistoryPerms || job.Status == historyStatusErrorRequesting:
+			case job.Status == historyStatusErrorReadMessageHistoryPerms || job.Status == historyStatusErrorRequesting || job.Status == historyStatusErrorDownloading:
 				failed++
 			case job.Status >= historyStatusAbortCompleted:
 				completed++
@@ -484,6 +497,10 @@ func guiCancelHistoryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	channelID := strings.TrimSpace(request.ChannelID)
+	if historyJobs == nil {
+		guiWriteError(w, http.StatusNotFound, "history job was not found")
+		return
+	}
 	found, changed := historyJobs.RequestCancel(channelID)
 	if !found {
 		guiWriteError(w, http.StatusNotFound, "history job was not found")

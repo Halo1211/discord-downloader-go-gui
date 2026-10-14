@@ -39,7 +39,8 @@ recommends requesting only the permissions the app needs.
 
 Download the single Windows amd64 executable from the
 [latest release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest)
-and place it in a dedicated application directory. Keep `settings.json`,
+and place it in a dedicated application directory. Rename it to
+`discord-downloader-go-gui.exe` to use the commands below. Keep `settings.json`,
 `cache/`, `database/`, `backups/`, and archive folders beside it when using
 relative paths.
 
@@ -75,7 +76,7 @@ channels; channel rules are useful for exceptions and separate destinations.
 On Windows, run the executable:
 
 ```powershell
-.\discord-downloader-go-gui-v1.0.0-windows-amd64.exe
+.\discord-downloader-go-gui.exe
 ```
 
 The dashboard opens on `127.0.0.1:7744` in a waiting state. Review the
@@ -86,13 +87,13 @@ Useful alternatives:
 
 ```powershell
 # Terminal-only mode
-.\discord-downloader-go-gui-v1.0.0-windows-amd64.exe --no-gui
+.\discord-downloader-go-gui.exe --no-gui
 
 # Use another settings base name
-.\discord-downloader-go-gui-v1.0.0-windows-amd64.exe --config archive-test
+.\discord-downloader-go-gui.exe --config archive-test
 
 # Open the dashboard in the system browser
-.\discord-downloader-go-gui-v1.0.0-windows-amd64.exe --gui-browser
+.\discord-downloader-go-gui.exe --gui-browser
 ```
 
 See [CLI and GUI](CLI-and-GUI.md) for all runtime flags and the local-only
@@ -109,24 +110,6 @@ binding rule.
 If the message is visible in Discord but nothing is saved, check the source
 rule, `save`, the relevant `saveImages`/`saveVideos`/`saveAudioFiles` option,
 filters, disk space, and the [Troubleshooting](Troubleshooting.md) guide.
-
-## Reference visuals from the original wiki
-
-The following public assets are retained as historical references from the
-original [`get-got/discord-downloader-go` wiki](https://github.com/get-got/discord-downloader-go/wiki).
-Discord changes its Developer Portal UI, so the written steps above are the
-source of truth. Never copy a token from any screenshot.
-
-![Discord Message Content Intent setting](assets/original-message-content-intent.png)
-
-The original wiki also published a setup video. It predates this GUI fork and
-may show unsupported legacy flows; use it only for general orientation:
-
-[![Historical Discord downloader tutorial](assets/tutorial-video-thumbnail.jpg)](https://www.youtube.com/watch?v=06UUXDQ80f8)
-
-The original wiki contained screenshots describing user-token extraction. They
-are intentionally not reproduced here because this fork documents bot-only
-operation and must not encourage self-bot authentication.
 
 ## Keep credentials safe
 

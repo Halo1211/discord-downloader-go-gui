@@ -27,7 +27,32 @@ var (
 	configFileYaml bool
 	config         configuration = defaultConfiguration()
 	configFileMu   sync.Mutex
+	configLogFile  *os.File
 )
+
+// Swap the logger before closing its old file so concurrent log writes cannot
+// target a closed handle. Retain the GUI buffer for every output destination.
+func configureLogOutput(path string) error {
+	var next *os.File
+	if path != "" {
+		var err error
+		next, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+	}
+	previous := configLogFile
+	if next != nil {
+		initGUILogCapture(io.MultiWriter(color.Output, next))
+	} else {
+		initGUILogCapture(color.Output)
+	}
+	configLogFile = next
+	if previous != nil {
+		return previous.Close()
+	}
+	return nil
+}
 
 //#region Config, Credentials
 
@@ -791,8 +816,13 @@ func loadConfigUnlocked() error {
 	configContent, err := os.ReadFile(configFile)
 	if err != nil {
 		log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to open file...\t%s", err))
-		createConfig()
-		return fmt.Errorf("settings file %q was created; add your Discord token, then restart the application", configFile)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := createConfig(); err != nil {
+				return fmt.Errorf("cannot create settings file %q: %w", configFile, err)
+			}
+			return fmt.Errorf("settings file %q was created; add your Discord token, then restart the application", configFile)
+		}
+		return fmt.Errorf("cannot read settings file %q: %w", configFile, err)
 	} else {
 		//TODO: Not even sure if this is realistic to do but would be nice to have line comma & trailing comma fixing
 
@@ -905,13 +935,8 @@ func loadConfigUnlocked() error {
 		}
 
 		// Log to File
-		if config.LogOutput != "" {
-			f, err := os.OpenFile(config.LogOutput, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
-			if err != nil {
-				log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to open LogOutput file...\t%s", err))
-			} else {
-				log.SetOutput(io.MultiWriter(color.Output, f))
-			}
+		if err := configureLogOutput(config.LogOutput); err != nil {
+			log.Println(lg("Settings", "loadConfig", color.HiRedString, "Failed to configure LogOutput file...\t%s", err))
 		}
 
 		// Misc Rules
@@ -1079,7 +1104,7 @@ func validateRuntimeCredentials(candidate configuration) error {
 	return nil
 }
 
-func createConfig() {
+func createConfig() error {
 	log.Println(lg("Settings", "create", color.YellowString, "Creating new settings file..."))
 
 	defaultConfig := defaultConfiguration()
@@ -1245,10 +1270,12 @@ func createConfig() {
 	defaultJSON, err := json.MarshalIndent(defaultConfig, "", "\t")
 	if err != nil {
 		log.Println(lg("Settings", "create", color.HiRedString, "Failed to format new settings...\t%s", err))
+		return err
 	} else {
 		err := os.WriteFile(configFile, defaultJSON, 0600)
 		if err != nil {
 			log.Println(lg("Settings", "create", color.HiRedString, "Failed to save new settings file...\t%s", err))
+			return err
 		} else {
 			log.Println(lg("Settings", "create", color.HiYellowString, "Created new settings file..."))
 			log.Println(lg("Settings", "create", color.HiYellowString,
@@ -1259,6 +1286,7 @@ func createConfig() {
 				"THERE ARE MANY HIDDEN SETTINGS AVAILABLE, SEE THE GITHUB README github.com/"+projectRepoBase))
 		}
 	}
+	return nil
 }
 
 func sourceDefault(source *configurationSource) {
@@ -1454,6 +1482,14 @@ func sourceDefault(source *configurationSource) {
 	}
 
 	// Misc Rules
+	if source.LogLinks == nil && config.LogLinks != nil {
+		copy := *config.LogLinks
+		source.LogLinks = &copy
+	}
+	if source.LogMessages == nil && config.LogMessages != nil {
+		copy := *config.LogMessages
+		source.LogMessages = &copy
+	}
 	if source.LogLinks != nil {
 		if source.LogLinks.Subfolders == nil {
 			source.LogLinks.Subfolders = &defSourceLog_Subfolders
@@ -1483,8 +1519,6 @@ func sourceDefault(source *configurationSource) {
 		if source.LogLinks.LogFailures == nil {
 			source.LogLinks.LogFailures = &defSourceLog_LogFailures
 		}
-	} else if config.LogLinks != nil {
-		source.LogLinks = config.LogLinks
 	}
 	if source.LogMessages != nil {
 		if source.LogMessages.Subfolders == nil {
@@ -1509,8 +1543,6 @@ func sourceDefault(source *configurationSource) {
 		if source.LogMessages.LineContent == nil {
 			source.LogMessages.LineContent = &defSourceLogMsg_LineContent
 		}
-	} else if config.LogMessages != nil {
-		source.LogMessages = config.LogMessages
 	}
 
 }
@@ -1547,7 +1579,7 @@ func adminChannelDefault(channel *configurationAdminChannel) {
 
 // Checks if message author is a specified bot admin.
 func isBotAdmin(m *discordgo.Message) bool {
-	if m == nil || m.Author == nil {
+	if m == nil || m.Author == nil || m.Author.ID == "" {
 		return false
 	}
 	// No Admins or Admin Channels
@@ -1573,6 +1605,7 @@ func isBotAdmin(m *discordgo.Message) bool {
 var emptySourceConfig configurationSource = configurationSource{}
 
 func getSource(m *discordgo.Message) configurationSource {
+	bot := currentDiscordSession()
 	if m == nil {
 		return emptySourceConfig
 	}
@@ -1617,15 +1650,24 @@ func getSource(m *discordgo.Message) configurationSource {
 	}
 
 	// Category Config
+	categoryID := chinfo.ParentID
+	if chinfo.Type == discordgo.ChannelTypeGuildPublicThread || chinfo.Type == discordgo.ChannelTypeGuildPrivateThread || chinfo.Type == discordgo.ChannelTypeGuildNewsThread {
+		if parent, parentErr := getChannel(chinfo.ParentID); parentErr == nil && parent != nil {
+			categoryID = parent.ParentID
+		}
+	}
 	for _, item := range config.Categories {
+		if categoryID != item.CategoryID && (item.CategoryIDs == nil || !stringInSlice(categoryID, *item.CategoryIDs)) {
+			continue
+		}
 		if item.CategoryBlacklist != nil {
-			if stringInSlice(chinfo.ID, *item.CategoryBlacklist) {
+			if stringInSlice(chinfo.ID, *item.CategoryBlacklist) || stringInSlice(chinfo.ParentID, *item.CategoryBlacklist) {
 				return emptySourceConfig
 			}
 		}
 		if item.CategoryID != "" {
 			if err == nil {
-				if chinfo.ParentID == item.CategoryID {
+				if categoryID == item.CategoryID {
 					return item
 				}
 			}
@@ -1634,7 +1676,7 @@ func getSource(m *discordgo.Message) configurationSource {
 		if item.CategoryIDs != nil {
 			for _, subcategory := range *item.CategoryIDs {
 				if err == nil {
-					if chinfo.ParentID == subcategory {
+					if categoryID == subcategory {
 						return item
 					}
 				}
@@ -1643,43 +1685,34 @@ func getSource(m *discordgo.Message) configurationSource {
 	}
 
 	// Server
-	getSourceServer := func(testID string, testSource configurationSource) configurationSource {
-		guild, err := bot.State.Guild(testID)
-		if err != nil {
-			guild, err = bot.Guild(testID)
+	getSourceServer := func(testID string, testSource configurationSource) (configurationSource, bool) {
+		guildID := chinfo.GuildID
+		if guildID == "" {
+			guildID = m.GuildID
 		}
-		if err == nil && guild != nil {
-			for _, channel := range guild.Channels {
-				if m.ChannelID == channel.ID || // Standard text channel
-					chinfo.ParentID == channel.ID { // Nested text channel
-					// Channel Blacklisting within Server
-					if testSource.ServerBlacklist != nil {
-						if stringInSlice(m.ChannelID, *testSource.ServerBlacklist) {
-							return emptySourceConfig
-						}
-						// Categories
-						if channel.ParentID != "" {
-							if stringInSlice(channel.ParentID, *testSource.ServerBlacklist) {
-								return emptySourceConfig
-							}
-						}
-					}
-					return testSource
-				}
+		if testID == "" || guildID != testID {
+			return emptySourceConfig, false
+		}
+		if testSource.ServerBlacklist != nil {
+			blocked := *testSource.ServerBlacklist
+			if stringInSlice(m.ChannelID, blocked) ||
+				stringInSlice(chinfo.ParentID, blocked) ||
+				stringInSlice(categoryID, blocked) {
+				return emptySourceConfig, true
 			}
 		}
-		return emptySourceConfig
+		return testSource, true
 	}
 	for _, item := range config.Servers {
 		if item.ServerID != "" {
-			if lookup := getSourceServer(item.ServerID, item); lookup != emptySourceConfig {
+			if lookup, matched := getSourceServer(item.ServerID, item); matched {
 				return lookup
 			}
 		}
 		// Multi-Server Config
 		if item.ServerIDs != nil {
 			for _, subserver := range *item.ServerIDs {
-				if lookup := getSourceServer(subserver, item); lookup != emptySourceConfig {
+				if lookup, matched := getSourceServer(subserver, item); matched {
 					return lookup
 				}
 			}
@@ -1719,13 +1752,17 @@ func getSource(m *discordgo.Message) configurationSource {
 				chinf, err = bot.Channel(m.ChannelID)
 			}
 			if err == nil {
-				if stringInSlice(chinf.ParentID, *config.AllBlacklistCategories) || stringInSlice(m.ChannelID, *config.AllBlacklistCategories) {
+				if chinf != nil && (stringInSlice(categoryID, *config.AllBlacklistCategories) || stringInSlice(m.ChannelID, *config.AllBlacklistCategories)) {
 					return emptySourceConfig
 				}
 			}
 		}
 		if config.AllBlacklistServers != nil {
-			if stringInSlice(m.GuildID, *config.AllBlacklistServers) {
+			guildID := chinfo.GuildID
+			if guildID == "" {
+				guildID = m.GuildID
+			}
+			if stringInSlice(guildID, *config.AllBlacklistServers) {
 				return emptySourceConfig
 			}
 		}
@@ -1781,7 +1818,7 @@ func getAdminChannelConfig(ChannelID string) configurationAdminChannel {
 }
 
 func isCommandableChannel(m *discordgo.Message) bool {
-	if m == nil || m.Author == nil {
+	if m == nil || m.Author == nil || m.Author.ID == "" {
 		return false
 	}
 	if config.AllowGeneralCommands {
@@ -1904,8 +1941,9 @@ type registeredChannelSource struct {
 
 func getAllRegisteredChannels() []registeredChannelSource {
 	var channels []registeredChannelSource
+	session := currentDiscordSession()
 	if config.All != nil { // ALL MODE
-		if bot == nil || bot.State == nil {
+		if session == nil || session.State == nil {
 			return channels
 		}
 		for _, guild := range discordGuildsSnapshot() {
@@ -1927,14 +1965,14 @@ func getAllRegisteredChannels() []registeredChannelSource {
 	} else { // STANDARD MODE
 		// Compile all channels sourced from config servers
 		for _, server := range config.Servers {
-			if bot == nil || bot.State == nil {
+			if session == nil || session.State == nil {
 				break
 			}
 			if server.ServerIDs != nil {
 				for _, subserver := range *server.ServerIDs {
-					guild, err := bot.State.Guild(subserver)
+					guild, err := session.State.Guild(subserver)
 					if err != nil {
-						guild, err = bot.Guild(subserver)
+						guild, err = session.Guild(subserver)
 					}
 					if err == nil && guild != nil {
 						for _, channel := range guild.Channels {
@@ -1946,9 +1984,9 @@ func getAllRegisteredChannels() []registeredChannelSource {
 				}
 			}
 			if isNumeric(server.ServerID) {
-				guild, err := bot.State.Guild(server.ServerID)
+				guild, err := session.State.Guild(server.ServerID)
 				if err != nil {
-					guild, err = bot.Guild(server.ServerID)
+					guild, err = session.Guild(server.ServerID)
 				}
 				if err == nil && guild != nil {
 					for _, channel := range guild.Channels {

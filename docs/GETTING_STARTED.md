@@ -21,11 +21,13 @@ discovery.
 
 Download the single Windows amd64 executable from the
 [latest release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest)
-and extract it to its own directory. Keep `settings.json`, `cache/`,
+and extract it to its own directory. Rename it to
+`discord-downloader-go-gui.exe` to use the commands below. Keep `settings.json`, `cache/`,
 `database/`, and downloaded media beside the executable so relative paths are
 predictable.
 
-Copy `settings.example.json` to `settings.json` and replace both placeholders:
+Copy [`settings.example.json`](../settings.example.json) to `settings.json` and
+replace its placeholders with your own IDs, bot token, and archive paths:
 
 ```json
 {
@@ -56,7 +58,7 @@ automatically after the dashboard is ready.
 For a terminal-only process:
 
 ```powershell
-.\discord-downloader-go.exe --no-gui
+.\discord-downloader-go-gui.exe --no-gui
 ```
 
 Use `--config=my-settings` to load `my-settings.json` or `my-settings.yaml`

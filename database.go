@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,12 +48,11 @@ func rebuildDownloadIndex() int {
 			return true
 		})
 	}
-	databaseMu.Unlock()
-
 	downloadIndexMu.Lock()
 	downloadIndex = index
 	downloadIndexMu.Unlock()
 	databaseDownloadCount.Store(int64(count))
+	databaseMu.Unlock()
 	return count
 }
 
@@ -301,7 +301,7 @@ func dbInsertDownload(download *downloadItem) error {
 	}
 	_, err := myDB.Use("Downloads").Insert(map[string]interface{}{
 		"URL":         normalizeDownloadURL(download.URL),
-		"Time":        download.Time.String(),
+		"Time":        download.Time.Format(time.RFC3339Nano),
 		"Destination": download.Destination,
 		"Filename":    download.Filename,
 		"ChannelID":   download.ChannelID,
@@ -339,7 +339,12 @@ func dbFindDownloadByIDLocked(id int) *downloadItem {
 	if !ok {
 		return nil
 	}
-	timeT, _ := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", timeString)
+	timeT, parseErr := time.Parse(time.RFC3339Nano, timeString)
+	if parseErr != nil {
+		// Older records may include a process-local monotonic clock suffix.
+		wallTime := strings.SplitN(timeString, " m=", 2)[0]
+		timeT, _ = time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", wallTime)
+	}
 	return &downloadItem{
 		URL:         stringValue(readBack["URL"]),
 		Time:        timeT,

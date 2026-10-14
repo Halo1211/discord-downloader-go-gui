@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,11 +54,16 @@ const (
 //#region Getters
 
 func getChannel(channelID string) (*discordgo.Channel, error) {
-	channel, err := bot.Channel(channelID)
-	if err != nil {
-		channel, err = bot.State.Channel(channelID)
+	session := currentDiscordSession()
+	if session == nil {
+		return nil, errors.New("Discord session is not initialized")
 	}
-	return channel, err
+	if session.State != nil {
+		if channel, err := session.State.Channel(channelID); err == nil && channel != nil {
+			return channel, nil
+		}
+	}
+	return session.Channel(channelID)
 }
 
 func getChannelErr(channelID string) error {
@@ -66,11 +72,16 @@ func getChannelErr(channelID string) error {
 }
 
 func getServer(guildID string) (*discordgo.Guild, error) {
-	guild, err := bot.Guild(guildID)
-	if err != nil {
-		guild, err = bot.State.Guild(guildID)
+	session := currentDiscordSession()
+	if session == nil {
+		return nil, errors.New("Discord session is not initialized")
 	}
-	return guild, err
+	if session.State != nil {
+		if guild, err := session.State.Guild(guildID); err == nil && guild != nil {
+			return guild, nil
+		}
+	}
+	return session.Guild(guildID)
 }
 
 func getServerErr(guildID string) error {
@@ -84,10 +95,10 @@ func getServerErr(guildID string) error {
 
 func getServerLabel(serverID string) (displayLabel string) {
 	displayLabel = "Discord"
-	sourceGuild, err := bot.State.Guild(serverID)
-	if err != nil {
-		sourceGuild, _ = bot.Guild(serverID)
+	if serverID == "" {
+		return displayLabel
 	}
+	sourceGuild, _ := getServer(serverID)
 	if sourceGuild != nil {
 		if sourceGuild.Name != "" {
 			displayLabel = sourceGuild.Name
@@ -98,23 +109,10 @@ func getServerLabel(serverID string) (displayLabel string) {
 
 func getCategoryLabel(channelID string) (displayLabel string) {
 	displayLabel = "Category"
-	sourceChannel, err := bot.State.Channel(channelID)
-	if err != nil {
-		sourceChannel, err = bot.Channel(channelID)
-	}
-	if err == nil {
-		if sourceChannel != nil {
-			sourceParent, err := bot.State.Channel(sourceChannel.ParentID)
-			if err != nil {
-				sourceParent, err = bot.Channel(sourceChannel.ParentID)
-			}
-			if err == nil {
-				if sourceParent != nil {
-					if sourceChannel.Name != "" {
-						displayLabel = sourceParent.Name
-					}
-				}
-			}
+	sourceChannel, _ := getChannel(channelID)
+	if sourceChannel != nil && sourceChannel.ParentID != "" {
+		if sourceParent, err := getChannel(sourceChannel.ParentID); err == nil && sourceParent != nil && sourceParent.Name != "" {
+			displayLabel = sourceParent.Name
 		}
 	}
 	return displayLabel
@@ -122,12 +120,9 @@ func getCategoryLabel(channelID string) (displayLabel string) {
 
 func getChannelLabel(channelID string, channelData *discordgo.Channel) (displayLabel string) {
 	displayLabel = channelID
-	sourceChannel, err := bot.State.Channel(channelID)
-	if err != nil {
-		sourceChannel, _ = bot.Channel(channelID)
-	}
-	if channelData != nil {
-		sourceChannel = channelData
+	sourceChannel := channelData
+	if sourceChannel == nil {
+		sourceChannel, _ = getChannel(channelID)
 	}
 	if sourceChannel != nil {
 		if sourceChannel.Name != "" {
@@ -168,7 +163,11 @@ func discordTimestampToSnowflake(format string, timestamp string) string {
 	var err error
 	parsed, err := time.ParseInLocation(format, timestamp, time.Local)
 	if err == nil {
-		snowflake = fmt.Sprint(((parsed.UnixNano() / int64(time.Millisecond)) - discordEpoch) << 22)
+		milliseconds := parsed.UnixMilli() - discordEpoch
+		if milliseconds < 0 || milliseconds > (1<<63-1)>>22 {
+			return ""
+		}
+		snowflake = fmt.Sprint(milliseconds << 22)
 	} else {
 		log.Println(lg("Main", "", color.HiRedString,
 			"Failed to convert timestamp to discord snowflake... Format: '%s', Timestamp: '%s' - Error:\t%s",
@@ -197,15 +196,22 @@ func messageToLower(message *discordgo.Message) *discordgo.Message {
 	return &newMessage
 }
 
-func fixMessage(m *discordgo.Message) *discordgo.Message {
+func fixMessage(m *discordgo.Message, executeCommands bool) *discordgo.Message {
 	// If message content is empty (likely due to userbot/selfbot)
 	ubIssue := "Message is corrupted due to endpoint restriction"
-	if m.Content == "" && len(m.Attachments) == 0 && len(m.Embeds) == 0 {
+	if m.Content == "" && len(m.Attachments) == 0 && len(m.Embeds) == 0 && len(m.StickerItems) == 0 && len(m.MessageSnapshots) == 0 {
+		session := currentDiscordSession()
+		if session == nil {
+			return m
+		}
 		// Get message history
-		mCache, err := bot.ChannelMessages(m.ChannelID, 20, "", "", "")
+		mCache, err := session.ChannelMessages(m.ChannelID, 20, "", "", "")
 		if err == nil {
 			if len(mCache) > 0 {
 				for _, mCached := range mCache {
+					if mCached == nil {
+						continue
+					}
 					if mCached.ID == m.ID {
 						// Fix original message having empty Guild ID
 						serverID := m.GuildID
@@ -216,7 +222,9 @@ func fixMessage(m *discordgo.Message) *discordgo.Message {
 							m.GuildID = serverID
 						}
 						// Parse commands
-						botCommands.FindAndExecute(bot, strings.ToLower(config.CommandPrefix), discordUserID(), messageToLower(m))
+						if executeCommands && botCommands != nil {
+							botCommands.FindAndExecute(session, strings.ToLower(config.CommandPrefix), discordUserID(), messageToLower(m))
+						}
 
 						break
 					}
@@ -245,10 +253,7 @@ func fixMessage(m *discordgo.Message) *discordgo.Message {
 func channelDisplay(channelID string) (sourceName string, sourceChannelName string) {
 	sourceChannelName = channelID
 	sourceName = "UNKNOWN"
-	sourceChannel, err := bot.State.Channel(channelID)
-	if err != nil {
-		sourceChannel, _ = bot.Channel(channelID)
-	}
+	sourceChannel, _ := getChannel(channelID)
 	if sourceChannel != nil {
 		// Channel Naming
 		if sourceChannel.Name != "" {
@@ -262,17 +267,14 @@ func channelDisplay(channelID string) (sourceName string, sourceChannelName stri
 		case discordgo.ChannelTypeGuildPublicThread:
 			// Server Naming
 			if sourceChannel.GuildID != "" {
-				sourceGuild, _ := bot.State.Guild(sourceChannel.GuildID)
+				sourceGuild, _ := getServer(sourceChannel.GuildID)
 				if sourceGuild != nil && sourceGuild.Name != "" {
 					sourceName = sourceGuild.Name
 				}
 			}
 			// Category Naming
 			if sourceChannel.ParentID != "" {
-				sourceParent, err := bot.State.Channel(sourceChannel.ParentID)
-				if err != nil {
-					sourceParent, _ = bot.Channel(sourceChannel.ParentID)
-				}
+				sourceParent, _ := getChannel(sourceChannel.ParentID)
 				if sourceParent != nil {
 					if sourceParent.Name != "" {
 						sourceChannelName = sourceParent.Name + " - " + sourceChannelName
@@ -427,28 +429,21 @@ func dataKeysDownload(input string, sourceConfig configurationSource, download d
 		categoryName := download.Message.ChannelID
 		guildName := download.Message.GuildID
 
-		chinfo, err := bot.State.Channel(download.Message.ChannelID)
-		if err != nil {
-			chinfo, err = bot.Channel(download.Message.ChannelID)
-		}
-		if err == nil {
+		chinfo, err := getChannel(download.Message.ChannelID)
+		if err == nil && chinfo != nil {
 			channelName = chinfo.Name
 			categoryID = chinfo.ParentID
 
-			catinfo, err := bot.State.Channel(categoryID)
-			if err != nil {
-				catinfo, err = bot.Channel(categoryID)
-			}
-			if err == nil {
-				categoryName = catinfo.Name
+			if categoryID != "" {
+				if catinfo, err := getChannel(categoryID); err == nil && catinfo != nil {
+					categoryName = catinfo.Name
+				}
 			}
 		}
-		guildinfo, err := bot.State.Guild(download.Message.GuildID)
-		if err != nil {
-			guildinfo, err = bot.Guild(download.Message.GuildID)
-		}
-		if err == nil {
-			guildName = guildinfo.Name
+		if download.Message.GuildID != "" {
+			if guildinfo, err := getServer(download.Message.GuildID); err == nil && guildinfo != nil {
+				guildName = guildinfo.Name
+			}
 		}
 
 		domain := "unknown"
@@ -749,6 +744,8 @@ func getEmbedColor(channelID string) int {
 	var err error
 	var color *string
 	var channelInfo *discordgo.Channel
+	session := currentDiscordSession()
+	userID := discordUserID()
 
 	// Assign Defined Color
 	if config.EmbedColor != nil {
@@ -772,9 +769,10 @@ func getEmbedColor(channelID string) int {
 	if color != nil {
 		// Defined as Role, fetch role color
 		if *color == "role" || *color == "user" {
-			botColor := bot.State.UserColor(botUser.ID, channelID)
-			if botColor != 0 {
-				return botColor
+			if session != nil && session.State != nil && userID != "" {
+				if botColor := session.State.UserColor(userID, channelID); botColor != 0 {
+					return botColor
+				}
 			}
 			goto color_random
 		}
@@ -800,14 +798,17 @@ func getEmbedColor(channelID string) int {
 	}
 
 	// User color
-	channelInfo, err = bot.State.Channel(channelID)
-	if err != nil {
-		channelInfo, err = bot.Channel(channelID)
+	if session == nil || session.State == nil || userID == "" {
+		goto color_random
 	}
-	if err == nil {
+	channelInfo, err = session.State.Channel(channelID)
+	if err != nil {
+		channelInfo, err = session.Channel(channelID)
+	}
+	if err == nil && channelInfo != nil {
 		if channelInfo.Type != discordgo.ChannelTypeDM && channelInfo.Type != discordgo.ChannelTypeGroupDM {
-			if bot.State.UserColor(botUser.ID, channelID) != 0 {
-				return bot.State.UserColor(botUser.ID, channelID)
+			if botColor := session.State.UserColor(userID, channelID); botColor != 0 {
+				return botColor
 			}
 		}
 	}
@@ -837,9 +838,13 @@ func buildEmbed(channelID string, title string, description string) *discordgo.M
 
 // Shortcut function for quickly replying a styled embed with Title & Description
 func replyEmbed(m *discordgo.Message, title string, description string) (*discordgo.Message, error) {
+	session := currentDiscordSession()
 	if m != nil {
-		if hasPerms(m.ChannelID, discordgo.PermissionSendMessages) {
-			mention := m.Author.Mention()
+		if session != nil && hasPerms(m.ChannelID, discordgo.PermissionSendMessages) {
+			mention := ""
+			if m.Author != nil && m.Author.ID != "" {
+				mention = m.Author.Mention()
+			}
 			if !config.CommandTagging { // Erase mention if tagging disabled
 				mention = ""
 			}
@@ -847,9 +852,9 @@ func replyEmbed(m *discordgo.Message, title string, description string) (*discor
 				if mention != "" { // Add space if mentioning
 					mention += " "
 				}
-				return bot.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%s**%s**\n\n%s", mention, title, description))
+				return session.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%s**%s**\n\n%s", mention, title, description))
 			} else {
-				return bot.ChannelMessageSendComplex(m.ChannelID,
+				return session.ChannelMessageSendComplex(m.ChannelID,
 					&discordgo.MessageSend{
 						Content: mention,
 						Embed:   buildEmbed(m.ChannelID, title, description),
@@ -890,6 +895,10 @@ func sendStatusLabel(status sendStatusType) string {
 }
 
 func sendStatusMessage(status sendStatusType) {
+	session := currentDiscordSession()
+	if session == nil {
+		return
+	}
 	for _, adminChannel := range config.AdminChannels {
 		if *adminChannel.LogStatus {
 			var message string
@@ -948,10 +957,10 @@ func sendStatusMessage(status sendStatusType) {
 					strings.ToUpper(label), getChannelLabel(adminChannel.ChannelID, nil)))
 			}
 			if hasPerms(adminChannel.ChannelID, discordgo.PermissionEmbedLinks) && !selfbot {
-				bot.ChannelMessageSendEmbed(adminChannel.ChannelID,
+				session.ChannelMessageSendEmbed(adminChannel.ChannelID,
 					buildEmbed(adminChannel.ChannelID, emoji+" Log — Status", message))
 			} else if hasPerms(adminChannel.ChannelID, discordgo.PermissionSendMessages) {
-				bot.ChannelMessageSend(adminChannel.ChannelID, message)
+				session.ChannelMessageSend(adminChannel.ChannelID, message)
 			} else {
 				log.Println(lg("Debug", "Bot Status", color.HiRedString, "Perms checks failed for sending %s status log to %s",
 					strings.ToUpper(label), adminChannel.ChannelID))
@@ -961,6 +970,10 @@ func sendStatusMessage(status sendStatusType) {
 }
 
 func sendErrorMessage(err string) {
+	session := currentDiscordSession()
+	if session == nil {
+		return
+	}
 	for _, adminChannel := range config.AdminChannels {
 		if *adminChannel.LogErrors {
 			// Send
@@ -969,13 +982,13 @@ func sendErrorMessage(err string) {
 					log.Println(lg("Debug", "sendErrorMessage", color.HiCyanString, "Sending embed log for error to %s",
 						adminChannel.ChannelID))
 				}
-				bot.ChannelMessageSendEmbed(adminChannel.ChannelID, buildEmbed(adminChannel.ChannelID, "Log — Error", err))
+				session.ChannelMessageSendEmbed(adminChannel.ChannelID, buildEmbed(adminChannel.ChannelID, "Log — Error", err))
 			} else if hasPerms(adminChannel.ChannelID, discordgo.PermissionSendMessages) {
 				if config.Debug {
 					log.Println(lg("Debug", "sendErrorMessage", color.HiCyanString, "Sending embed log for error to %s",
 						adminChannel.ChannelID))
 				}
-				bot.ChannelMessageSend(adminChannel.ChannelID, err)
+				session.ChannelMessageSend(adminChannel.ChannelID, err)
 			} else {
 				log.Println(lg("Debug", "sendErrorMessage", color.HiRedString, "Perms checks failed for sending error log to %s",
 					adminChannel.ChannelID))
@@ -1180,10 +1193,21 @@ func downloadDiscordStickers() {
 			}
 			guildName := "UNKNOWN"
 			guild, err := session.Guild(serverID)
-			if err != nil {
+			if err != nil || guild == nil {
 				log.Println(lg("Discord", "Stickers", color.HiRedString, "Error fetching server %s... %s", serverID, err))
 			} else {
 				guildName = guild.Name
+				stickerEndpoint := discordgo.EndpointGuildStickers(serverID)
+				stickerData, listErr := session.RequestWithBucketID("GET", stickerEndpoint, nil, stickerEndpoint)
+				if listErr != nil {
+					log.Println(lg("Discord", "Stickers", color.HiRedString, "Error listing stickers from %s... %s", serverID, listErr))
+					continue
+				}
+				var stickers []*discordgo.Sticker
+				if err := json.Unmarshal(stickerData, &stickers); err != nil {
+					log.Println(lg("Discord", "Stickers", color.HiRedString, "Invalid sticker list from %s... %s", serverID, err))
+					continue
+				}
 				subfolder, pathErr := safePathUnderBase(destination, clearPathIllegalChars(guildName))
 				if pathErr != nil {
 					log.Println(lg("Discord", "Stickers", color.HiRedString, "Invalid sticker subfolder: %s", pathErr))
@@ -1197,7 +1221,7 @@ func downloadDiscordStickers() {
 				countDownloaded := 0
 				countSkipped := 0
 				countFailed := 0
-				for _, sticker := range guild.Stickers {
+				for _, sticker := range stickers {
 					if runtimeIsStopping() {
 						return
 					}

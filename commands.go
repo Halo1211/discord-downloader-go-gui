@@ -51,7 +51,7 @@ func handleCommands() *exrouter.Route {
 					log.Println(lg("Command", "Ping", color.HiRedString, "Error sending pong message:\t%s", err))
 				} else {
 					afterPong := time.Now()
-					latency := bot.HeartbeatLatency().Milliseconds()
+					latency := ctx.Ses.HeartbeatLatency().Milliseconds()
 					roundtrip := afterPong.Sub(beforePong).Milliseconds()
 					mention := ctx.Msg.Author.Mention()
 					if !config.CommandTagging { // Erase mention if tagging disabled
@@ -66,9 +66,9 @@ func handleCommands() *exrouter.Route {
 							if mention != "" { // Add space if mentioning
 								mention += " "
 							}
-							bot.ChannelMessageEdit(pong.ChannelID, pong.ID, fmt.Sprintf("%s**Command — Ping**\n\n%s", mention, content))
+							ctx.Ses.ChannelMessageEdit(pong.ChannelID, pong.ID, fmt.Sprintf("%s**Command — Ping**\n\n%s", mention, content))
 						} else {
-							bot.ChannelMessageEditComplex(&discordgo.MessageEdit{
+							ctx.Ses.ChannelMessageEditComplex(&discordgo.MessageEdit{
 								ID:      pong.ID,
 								Channel: pong.ChannelID,
 								Content: &mention,
@@ -141,7 +141,7 @@ func handleCommands() *exrouter.Route {
 					getBoundServersCount(),
 					getBoundUsersCount(),
 					len(config.AdminChannels),
-					bot.HeartbeatLatency().Milliseconds(),
+					ctx.Ses.HeartbeatLatency().Milliseconds(),
 				)
 				if sourceConfig := getSource(ctx.Msg); sourceConfig != emptySourceConfig {
 					configJson, _ := json.MarshalIndent(sourceConfig, "", "\t")
@@ -186,6 +186,17 @@ func handleCommands() *exrouter.Route {
 
 	router.On("history", func(ctx *exrouter.Context) {
 		if isCommandableChannel(ctx.Msg) {
+			if !isBotAdmin(ctx.Msg) {
+				log.Println(lg("Command", "History", color.CyanString,
+					"%s tried to handle history but lacked proper permission.", getUserIdentifier(*ctx.Msg.Author)))
+				if hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
+					if _, err := replyEmbed(ctx.Msg, "Command — History", cmderrLackingBotAdminPerms); err != nil {
+						log.Println(lg("Command", "History", color.HiRedString, cmderrSendFailure,
+							getUserIdentifier(*ctx.Msg.Author), err))
+					}
+				}
+				return
+			}
 			// Vars
 			var all = false
 			var channels []string
@@ -209,20 +220,17 @@ func handleCommands() *exrouter.Route {
 				if argKey == 0 { // skip head
 					continue
 				}
+				lowerArg := strings.ToLower(argValue)
 				//SUBCOMMAND: cancel
-				if strings.Contains(strings.ToLower(argValue), "cancel") ||
-					strings.Contains(strings.ToLower(argValue), "stop") {
+				if lowerArg == "cancel" || lowerArg == "stop" {
 					shouldAbort = true
-				} else if strings.Contains(strings.ToLower(argValue), "dbwipe") ||
-					strings.Contains(strings.ToLower(argValue), "wipedb") { //SUBCOMMAND: dbwipe
+				} else if lowerArg == "dbwipe" || lowerArg == "wipedb" { //SUBCOMMAND: dbwipe
 					shouldProcess = false
 					shouldWipeDB = true
-				} else if strings.Contains(strings.ToLower(argValue), "cachewipe") ||
-					strings.Contains(strings.ToLower(argValue), "wipecache") { //SUBCOMMAND: cachewipe
+				} else if lowerArg == "cachewipe" || lowerArg == "wipecache" { //SUBCOMMAND: cachewipe
 					shouldProcess = false
 					shouldWipeCache = true
-				} else if strings.Contains(strings.ToLower(argValue), "help") ||
-					strings.Contains(strings.ToLower(argValue), "info") { //SUBCOMMAND: help
+				} else if lowerArg == "help" || lowerArg == "info" { //SUBCOMMAND: help
 					shouldProcess = false
 					if hasPerms(ctx.Msg.ChannelID, discordgo.PermissionSendMessages) {
 						//content := fmt.Sprintf("")
@@ -235,9 +243,7 @@ func handleCommands() *exrouter.Route {
 						log.Println(lg("Command", "History", color.HiRedString, fmtBotSendPerm, ctx.Msg.ChannelID))
 					}
 					log.Println(lg("Command", "History", color.CyanString, "%s requested history help.", getUserIdentifier(*ctx.Msg.Author)))
-				} else if strings.Contains(strings.ToLower(argValue), "list") ||
-					strings.Contains(strings.ToLower(argValue), "status") ||
-					strings.Contains(strings.ToLower(argValue), "output") { //SUBCOMMAND: list
+				} else if lowerArg == "list" || lowerArg == "status" || lowerArg == "output" { //SUBCOMMAND: list
 					shouldProcess = false
 					//MARKER: history jobs list
 
@@ -303,8 +309,8 @@ func handleCommands() *exrouter.Route {
 					// done
 					log.Println(lg("Command", "History", color.HiRedString, "%s requested statuses of history jobs.",
 						getUserIdentifier(*ctx.Msg.Author)))
-				} else if strings.Contains(strings.ToLower(argValue), "--before=") { // before key
-					before = strings.ReplaceAll(strings.ToLower(argValue), "--before=", "")
+				} else if strings.HasPrefix(lowerArg, "--before=") { // before key
+					before = strings.TrimPrefix(lowerArg, "--before=")
 					if isDate(before) {
 						beforeID = discordTimestampToSnowflake("2006-01-02", before)
 					} else if isNumeric(before) {
@@ -319,8 +325,8 @@ func handleCommands() *exrouter.Route {
 						log.Println(lg("Command", "History", color.CyanString, "Date before range applied, snowflake %s, converts back to %s",
 							beforeID, discordSnowflakeToTimestamp(beforeID, "2006-01-02T15:04:05.000Z07:00")))
 					}
-				} else if strings.Contains(strings.ToLower(argValue), "--since=") { //  since key
-					since = strings.ReplaceAll(strings.ToLower(argValue), "--since=", "")
+				} else if strings.HasPrefix(lowerArg, "--since=") { //  since key
+					since = strings.TrimPrefix(lowerArg, "--since=")
 					if isDate(since) {
 						sinceID = discordTimestampToSnowflake("2006-01-02", since)
 					} else if isNumeric(since) {
@@ -339,11 +345,15 @@ func handleCommands() *exrouter.Route {
 					// Actual Source ID(s)
 					targets := strings.Split(ctx.Args.Get(argKey), ",")
 					for _, target := range targets {
+						target = strings.TrimSpace(target)
+						if target == "" {
+							continue
+						}
 						if isNumeric(target) {
 							// Test/Use if number is guild
-							guild, err := bot.State.Guild(target)
+							guild, err := ctx.Ses.State.Guild(target)
 							if err != nil {
-								guild, err = bot.Guild(target)
+								guild, err = ctx.Ses.Guild(target)
 							}
 							if err == nil {
 								if config.Debug {
@@ -364,9 +374,9 @@ func handleCommands() *exrouter.Route {
 									}
 								}
 							} else { // Test/Use if number is channel or category
-								ch, err := bot.State.Channel(target)
+								ch, err := ctx.Ses.State.Channel(target)
 								if err != nil {
-									ch, err = bot.Channel(target)
+									ch, err = ctx.Ses.Channel(target)
 								}
 								if err == nil {
 									if ch.Type == discordgo.ChannelTypeGuildCategory {
@@ -394,7 +404,7 @@ func handleCommands() *exrouter.Route {
 										target))
 								}
 							}
-						} else if strings.Contains(strings.ToLower(target), "all") {
+						} else if strings.EqualFold(target, "all") {
 							for _, channel := range getAllRegisteredChannels() {
 								channels = append(channels, channel.ChannelID)
 							}
@@ -444,9 +454,9 @@ func handleCommands() *exrouter.Route {
 				//#region Process Channels
 				if shouldProcess && config.Debug {
 					nameGuild := channel
-					chinfo, err := bot.State.Channel(channel)
+					chinfo, err := ctx.Ses.State.Channel(channel)
 					if err != nil {
-						chinfo, err = bot.Channel(channel)
+						chinfo, err = ctx.Ses.Channel(channel)
 					}
 					if err == nil {
 						nameGuild = getServerLabel(chinfo.GuildID)

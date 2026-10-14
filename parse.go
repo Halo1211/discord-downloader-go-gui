@@ -69,8 +69,8 @@ func instagramLoginNeeds2FA(err error) bool {
 
 func botLoadAPIs() {
 	defer mainWg.Done()
-	twitterConnected = false
-	instagramConnected = false
+	twitterConnected.Store(false)
+	instagramConnected.Store(false)
 
 	// Twitter API
 	if config.Credentials.TwitterAuthEnabled != nil && *config.Credentials.TwitterAuthEnabled {
@@ -163,7 +163,7 @@ func botLoadAPIs() {
 					} else {
 						if twitterScraper.IsLoggedIn() {
 							log.Println(lg("API", "Twitter", color.HiMagentaString, "%s", fmt.Sprintf("Connected to @%s via new login", config.Credentials.TwitterUsername)))
-							twitterConnected = true
+							twitterConnected.Store(true)
 							if err := exportTwitterSession(); err != nil {
 								log.Println(lg("API", "Twitter", color.HiYellowString, "Could not cache session: %s", err))
 							}
@@ -175,10 +175,10 @@ func botLoadAPIs() {
 				} else {
 					log.Println(lg("API", "Twitter", color.HiMagentaString,
 						"Connected to @%s via cache", config.Credentials.TwitterUsername))
-					twitterConnected = true
+					twitterConnected.Store(true)
 				}
 
-				if twitterConnected {
+				if twitterConnected.Load() {
 					twitterProxy(false)
 				}
 			} else {
@@ -250,7 +250,7 @@ func botLoadAPIs() {
 								} else {
 									log.Println(lg("API", "Instagram", color.HiMagentaString,
 										"Connected to @%s via new 2FA-Generated login", instagramClient.Account.Username))
-									instagramConnected = true
+									instagramConnected.Store(true)
 									if err := exportInstagramSession(); err != nil {
 										log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
 									}
@@ -274,7 +274,7 @@ func botLoadAPIs() {
 									} else {
 										log.Println(lg("API", "Instagram", color.HiMagentaString,
 											"Connected to @%s via new 2FA-Code login", instagramClient.Account.Username))
-										instagramConnected = true
+										instagramConnected.Store(true)
 										if err := exportInstagramSession(); err != nil {
 											log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
 										}
@@ -296,7 +296,7 @@ func botLoadAPIs() {
 					} else {
 						log.Println(lg("API", "Instagram", color.HiMagentaString,
 							"Connected to @%s via new login", instagramClient.Account.Username))
-						instagramConnected = true
+						instagramConnected.Store(true)
 						if err := exportInstagramSession(); err != nil {
 							log.Println(lg("API", "Instagram", color.HiYellowString, "Could not cache session: %s", err))
 						}
@@ -306,7 +306,7 @@ func botLoadAPIs() {
 					instagramProxy(true)
 					log.Println(lg("API", "Instagram", color.HiMagentaString,
 						"Connected to @%s via cache", instagramClient.Account.Username))
-					instagramConnected = true
+					instagramConnected.Store(true)
 				}
 			} else {
 				log.Println(lg("API", "Instagram", color.MagentaString,
@@ -633,12 +633,15 @@ type flickrPhotoObject struct {
 	Stat string `json:"stat"`
 }
 
-func getFlickrUrlFromPhotoId(photoId string) string {
+func getFlickrUrlFromPhotoId(photoId string) (string, error) {
 	reqUrl := fmt.Sprintf("https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=%s&api_key=%s&photo_id=%s",
-		"flickr.photos.getSizes", config.Credentials.FlickrApiKey, photoId)
+		"flickr.photos.getSizes", url.QueryEscape(config.Credentials.FlickrApiKey), url.QueryEscape(photoId))
 	flickrPhoto := new(flickrPhotoObject)
 	if err := getJSON(reqUrl, flickrPhoto); err != nil {
-		return ""
+		return "", err
+	}
+	if flickrPhoto.Stat != "ok" {
+		return "", errors.New("Flickr could not return photo sizes")
 	}
 	var bestSize flickrPhotoSizeObject
 	for _, size := range flickrPhoto.Sizes.Size {
@@ -650,7 +653,10 @@ func getFlickrUrlFromPhotoId(photoId string) string {
 			}
 		}
 	}
-	return bestSize.Source
+	if bestSize.Source == "" {
+		return "", errors.New("Flickr photo has no downloadable media")
+	}
+	return bestSize.Source, nil
 }
 
 func getFlickrPhotoUrls(url string) (map[string]string, error) {
@@ -665,7 +671,11 @@ func getFlickrPhotoUrls(url string) (map[string]string, error) {
 	if photoId == "" {
 		return nil, errors.New("unable to get Photo ID from URL")
 	}
-	return map[string]string{getFlickrUrlFromPhotoId(photoId): ""}, nil
+	link, err := getFlickrUrlFromPhotoId(photoId)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{link: ""}, nil
 }
 
 type flickrAlbumObject struct {
@@ -695,11 +705,11 @@ type flickrAlbumObject struct {
 	Stat string `json:"stat"`
 }
 
-func getFlickrAlbumUrls(url string) (map[string]string, error) {
+func getFlickrAlbumUrls(inputURL string) (map[string]string, error) {
 	if config.Credentials.FlickrApiKey == "" {
 		return nil, errors.New("invalid Flickr API Key Set")
 	}
-	matches := regexUrlFlickrAlbum.FindStringSubmatch(url)
+	matches := regexUrlFlickrAlbum.FindStringSubmatch(inputURL)
 	if len(matches) < 10 || matches[9] == "" {
 		return nil, errors.New("unable to find Flickr Album ID in URL")
 	}
@@ -707,15 +717,53 @@ func getFlickrAlbumUrls(url string) (map[string]string, error) {
 	if albumId == "" {
 		return nil, errors.New("unable to get Album ID from URL")
 	}
-	reqUrl := fmt.Sprintf("https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=%s&api_key=%s&photoset_id=%s&per_page=500",
-		"flickr.photosets.getPhotos", config.Credentials.FlickrApiKey, albumId)
-	flickrAlbum := new(flickrAlbumObject)
-	if err := getJSON(reqUrl, flickrAlbum); err != nil {
-		return nil, err
+	// Flickr requires the owner's NSID even when the album URL uses a
+	// custom username instead of that ID.
+	ownerID := matches[3]
+	if !strings.Contains(ownerID, "@") {
+		lookupURL := "https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=flickr.people.findByUsername&api_key=" +
+			url.QueryEscape(config.Credentials.FlickrApiKey) + "&username=" + url.QueryEscape(ownerID)
+		var lookup struct {
+			Stat string `json:"stat"`
+			User struct {
+				NSID string `json:"nsid"`
+			} `json:"user"`
+		}
+		if err := getJSON(lookupURL, &lookup); err != nil {
+			return nil, err
+		}
+		if lookup.Stat != "ok" || lookup.User.NSID == "" {
+			return nil, errors.New("Flickr could not resolve album owner")
+		}
+		ownerID = lookup.User.NSID
 	}
 	links := make(map[string]string)
-	for _, photo := range flickrAlbum.Photoset.Photo {
-		links[getFlickrUrlFromPhotoId(photo.ID)] = ""
+	for page := 1; ; page++ {
+		reqURL := fmt.Sprintf("https://www.flickr.com/services/rest/?format=json&nojsoncallback=1&method=%s&api_key=%s&photoset_id=%s&user_id=%s&per_page=500&page=%d",
+			"flickr.photosets.getPhotos", url.QueryEscape(config.Credentials.FlickrApiKey), url.QueryEscape(albumId), url.QueryEscape(ownerID), page)
+		album := new(flickrAlbumObject)
+		if err := getJSON(reqURL, album); err != nil {
+			return nil, err
+		}
+		if album.Stat != "ok" {
+			return nil, errors.New("Flickr could not return album photos")
+		}
+		if album.Photoset.Page != page {
+			return nil, errors.New("Flickr album pagination cursor did not advance")
+		}
+		for _, photo := range album.Photoset.Photo {
+			link, err := getFlickrUrlFromPhotoId(photo.ID)
+			if err != nil {
+				return nil, err
+			}
+			links[link] = ""
+		}
+		if page >= album.Photoset.Pages {
+			break
+		}
+		if len(album.Photoset.Photo) == 0 {
+			return nil, errors.New("Flickr returned an empty page before the end of the album")
+		}
 	}
 	return links, nil
 }
@@ -786,32 +834,7 @@ func getTistoryWithCDNUrls(urlI string) (map[string]string, error) {
 
 func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 	client := jsonHTTPClient
-	request, err := http.NewRequest("HEAD", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Add("Accept-Encoding", "identity")
-	request.Header.Add("User-Agent", sneakyUserAgent)
-	respHead, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer respHead.Body.Close()
-	if respHead.StatusCode < http.StatusOK || respHead.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("Tistory page returned HTTP status %s", respHead.Status)
-	}
-
-	contentType := ""
-	for headerKey, headerValue := range respHead.Header {
-		if strings.EqualFold(headerKey, "Content-Type") && len(headerValue) > 0 {
-			contentType = headerValue[0]
-		}
-	}
-	if !strings.Contains(contentType, "text/html") {
-		return nil, nil
-	}
-
-	request, err = http.NewRequest(http.MethodGet, url, nil)
+	request, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -824,6 +847,9 @@ func getPossibleTistorySiteUrls(url string) (map[string]string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("Tistory page returned HTTP status %s", resp.Status)
+	}
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		return nil, nil
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
