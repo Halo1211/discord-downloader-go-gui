@@ -19,8 +19,6 @@ bot-account requirements.
   defaults, limits, and template placeholders.
 - [CLI and GUI](CLI-and-GUI.md) — runtime flags, dashboard workflow, and local
   security model.
-- [Reference Media](Media-References.md) — dashboard screenshot, original wiki
-  attribution, and the historical tutorial link.
 - [Troubleshooting](Troubleshooting.md) — common setup and runtime problems.
 - [Development](Development.md) — tests, builds, and release packaging.
 
@@ -34,10 +32,9 @@ media.
 
 ## Release model
 
-The maintained release is distributed as one Windows amd64 executable. It is
-intended to run beside `settings.json`, `cache/`, `database/`, and the chosen
-archive folders. The maintainer's local `release/` directory is ignored by
-Git and is not part of the source repository.
+The maintained release is distributed as one Windows amd64 executable. Keep
+`settings.json`, `cache/`, `database/`, and the chosen archive folders in the
+application directory when using relative paths.
 
 ## Original project
 

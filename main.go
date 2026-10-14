@@ -60,9 +60,9 @@ var (
 	duploCatalog *duplo.Store
 
 	// APIs
-	twitterConnected   bool = false
+	twitterConnected   atomic.Bool
 	twitterScraper     *twitterscraper.Scraper
-	instagramConnected bool = false
+	instagramConnected atomic.Bool
 	instagramClient    *goinsta.Instagram
 )
 
@@ -329,6 +329,12 @@ func main() {
 	mainWg.Wait() // wait because credentials from config
 
 	//#region <<< CONNECTIONS >>>
+	// Gateway messages may arrive during Open, before startup has completed.
+	// Their URL parsers must already be initialized when handlers are installed.
+	if err := compileRegex(); err != nil {
+		log.Println(lg("Regex", "", color.HiRedString, "Error initializing:\t%s", err))
+		properExit()
+	}
 
 	mainWg.Add(2)
 
@@ -336,17 +342,6 @@ func main() {
 
 	go botLoadDiscord()
 
-	//#endregion
-
-	//#region Initialize Regex
-	mainWg.Add(1)
-	go func() {
-		defer mainWg.Done()
-		if err := compileRegex(); err != nil {
-			log.Println(lg("Regex", "", color.HiRedString, "Error initializing:\t%s", err))
-			return
-		}
-	}()
 	//#endregion
 
 	//#region [Loops] History Job Processing
@@ -380,7 +375,7 @@ func main() {
 						nhistoryJobCntRunning++
 					} else if job.Status == historyStatusAbortRequested || job.Status == historyStatusAbortCompleted {
 						nhistoryJobCntAborted++
-					} else if job.Status == historyStatusErrorReadMessageHistoryPerms || job.Status == historyStatusErrorRequesting {
+					} else if job.Status == historyStatusErrorReadMessageHistoryPerms || job.Status == historyStatusErrorRequesting || job.Status == historyStatusErrorDownloading {
 						nhistoryJobCntErrored++
 					} else if job.Status >= historyStatusCompletedNoMoreMessages {
 						nhistoryJobCntCompleted++

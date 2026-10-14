@@ -25,6 +25,7 @@ const (
 	historyStatusAbortCompleted
 	historyStatusErrorReadMessageHistoryPerms
 	historyStatusErrorRequesting
+	historyStatusErrorDownloading
 	historyStatusCompletedNoMoreMessages
 	historyStatusCompletedToBeforeFilter
 	historyStatusCompletedToSinceFilter
@@ -44,6 +45,8 @@ func historyStatusLabel(status historyStatus) string {
 		return "ERROR: Cannot Read Message History"
 	case historyStatusErrorRequesting:
 		return "ERROR: Message Requests Failed"
+	case historyStatusErrorDownloading:
+		return "ERROR: Downloads Could Not Be Completed"
 	case historyStatusCompletedNoMoreMessages:
 		return "COMPLETE: No More Messages"
 	case historyStatusCompletedToBeforeFilter:
@@ -208,6 +211,15 @@ func (s *historyJobStore) SetStatus(key string, status historyStatus) bool {
 	if !exists {
 		return false
 	}
+	if job.Status == historyStatusAbortCompleted {
+		return true
+	}
+	if job.Status == historyStatusAbortRequested {
+		if status == historyStatusRunning || status == historyStatusWaiting {
+			return true
+		}
+		status = historyStatusAbortCompleted
+	}
 	job.Status = status
 	job.Updated = time.Now()
 	s.jobs[key] = job
@@ -262,6 +274,8 @@ func mergeHistoryTerminalStatus(current, candidate historyStatus) historyStatus 
 		case historyStatusErrorReadMessageHistoryPerms:
 			return 5
 		case historyStatusErrorRequesting:
+			return 4
+		case historyStatusErrorDownloading:
 			return 4
 		case historyStatusCompletedToSinceFilter:
 			return 3
@@ -318,9 +332,9 @@ type historyCache struct {
 	PendingLatest  string // candidate high-water mark while a scan is still running
 }
 
-func processHistoryMessageBatch(messages []*discordgo.Message, channel *discordgo.Channel, workers int) (int64, int64, time.Duration) {
+func processHistoryMessageBatch(messages []*discordgo.Message, channel *discordgo.Channel, workers int) (int64, int64, time.Duration, bool) {
 	if len(messages) == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, true
 	}
 	if workers < 1 {
 		workers = 1
@@ -331,14 +345,19 @@ func processHistoryMessageBatch(messages []*discordgo.Message, channel *discordg
 
 	started := time.Now()
 	jobs := make(chan *discordgo.Message)
-	results := make(chan []downloadedItem, workers)
+	type messageResult struct {
+		items    []downloadedItem
+		complete bool
+	}
+	results := make(chan messageResult, workers)
 	var workerWG sync.WaitGroup
 	workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer workerWG.Done()
 			for message := range jobs {
-				results <- handleMessage(message, channel, false, true)
+				items, complete := handleMessageResult(message, channel, false, true)
+				results <- messageResult{items, complete}
 			}
 		}()
 	}
@@ -353,16 +372,18 @@ func processHistoryMessageBatch(messages []*discordgo.Message, channel *discordg
 
 	var downloads int64
 	var bytes int64
-	for items := range results {
-		downloads += int64(len(items))
-		for _, item := range items {
+	complete := true
+	for result := range results {
+		complete = complete && result.complete
+		downloads += int64(len(result.items))
+		for _, item := range result.items {
 			bytes += item.Filesize
 		}
 	}
 	if downloads == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, complete
 	}
-	return downloads, bytes, time.Since(started)
+	return downloads, bytes, time.Since(started), complete
 }
 
 func effectiveHistoryDownloadWorkers() int {
@@ -446,26 +467,27 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 	}
 
 	// Vars
-	baseChannelInfo, err := bot.State.Channel(subjectChannelID)
-	if err != nil {
-		baseChannelInfo, err = bot.Channel(subjectChannelID)
+	session := currentDiscordSession()
+	if session == nil {
+		setHistoryJobStatus(subjectChannelID, historyStatusErrorRequesting)
+		log.Println(lg("History", "", color.HiRedString, "%s", logPrefix+"Discord session is not available"))
+		return -1
+	}
+	var baseChannelInfo *discordgo.Channel
+	if session.State != nil {
+		baseChannelInfo, err = session.State.Channel(subjectChannelID)
+	}
+	if baseChannelInfo == nil {
+		baseChannelInfo, err = session.Channel(subjectChannelID)
 		if err != nil {
 			log.Println(lg("History", "", color.HiRedString, logPrefix+"Error fetching channel data from discordgo:\t%s", err))
-			if job, exists := historyJobs.Get(subjectChannelID); exists {
-				job.Status = historyStatusErrorRequesting
-				job.Updated = time.Now()
-				historyJobs.Set(subjectChannelID, job)
-			}
+			setHistoryJobStatus(subjectChannelID, historyStatusErrorRequesting)
 			return -1
 		}
 	}
 	if baseChannelInfo == nil {
 		log.Println(lg("History", "", color.HiRedString, "%s", logPrefix+"Discord returned no channel data"))
-		if job, exists := historyJobs.Get(subjectChannelID); exists {
-			job.Status = historyStatusErrorRequesting
-			job.Updated = time.Now()
-			historyJobs.Set(subjectChannelID, job)
-		}
+		setHistoryJobStatus(subjectChannelID, historyStatusErrorRequesting)
 		return -1
 	}
 
@@ -488,7 +510,7 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 		if commandingMessage != nil {
 			return replyEmbed(commandingMessage, title, description)
 		}
-		return bot.ChannelMessageSendEmbed(subjectChannelID, buildEmbed(subjectChannelID, title, description))
+		return session.ChannelMessageSendEmbed(subjectChannelID, buildEmbed(subjectChannelID, title, description))
 	}
 
 	guildName := getServerLabel(baseChannelInfo.GuildID)
@@ -509,13 +531,18 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 
 	// Index Threads
 	indexedThreads := map[string]bool{}
-	if threads, err := bot.ThreadsActive(subjectChannelID); err == nil {
-		for _, thread := range threads.Threads {
-			if indexedThreads[thread.ID] {
-				continue
+	if threads, err := session.ThreadsActive(subjectChannelID); err == nil {
+		if threads != nil {
+			for _, thread := range threads.Threads {
+				if thread == nil {
+					continue
+				}
+				if indexedThreads[thread.ID] {
+					continue
+				}
+				subjectChannels = append(subjectChannels, *thread)
+				indexedThreads[thread.ID] = true
 			}
-			subjectChannels = append(subjectChannels, *thread)
-			indexedThreads[thread.ID] = true
 		}
 	}
 	archivedThreadSources := []struct {
@@ -523,13 +550,13 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 		fetch func(*time.Time) (*discordgo.ThreadsList, error)
 	}{
 		{name: "public archived", fetch: func(before *time.Time) (*discordgo.ThreadsList, error) {
-			return bot.ThreadsArchived(subjectChannelID, before, 100)
+			return session.ThreadsArchived(subjectChannelID, before, 100)
 		}},
 		{name: "private archived", fetch: func(before *time.Time) (*discordgo.ThreadsList, error) {
-			return bot.ThreadsPrivateArchived(subjectChannelID, before, 100)
+			return session.ThreadsPrivateArchived(subjectChannelID, before, 100)
 		}},
 		{name: "joined private archived", fetch: func(before *time.Time) (*discordgo.ThreadsList, error) {
-			return bot.ThreadsPrivateJoinedArchived(subjectChannelID, before, 100)
+			return session.ThreadsPrivateJoinedArchived(subjectChannelID, before, 100)
 		}},
 	}
 	for _, source := range archivedThreadSources {
@@ -701,6 +728,7 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 					rangeContent += fmt.Sprintf("**Before:** `%s`\n", beforeRange)
 				}
 				channelBefore = beforeRange
+				beforeID = beforeRange
 			}
 
 			var sinceRange = channelSince
@@ -754,16 +782,20 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 
 		MessageRequestingLoop:
 			for {
+				if historyAbortRequested(subjectChannelID) {
+					channelStatus = historyStatusAbortCompleted
+					stopAllChannels = true
+					break MessageRequestingLoop
+				}
+				pageBefore := beforeID
+				if useIncrementalCheckpoint {
+					channelCache.Updated = time.Now()
+					channelCache.Running = true
+					channelCache.RunningBefore = pageBefore
+					writeHistoryCache(channel.ID, channelCache)
+				}
 				// Next 100
 				if beforeTime != (time.Time{}) {
-					messageRequestCount++
-					if useIncrementalCheckpoint {
-						channelCache.Updated = time.Now()
-						channelCache.Running = true
-						channelCache.RunningBefore = beforeID
-						writeHistoryCache(channel.ID, channelCache)
-					}
-
 					// Update Status
 					if logHistoryStatus {
 						log.Println(lg("History", "", color.CyanString,
@@ -807,10 +839,10 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 						} else {
 							// Edit Status
 							if selfbot {
-								responseMsg, err = bot.ChannelMessageEdit(responseMsg.ChannelID, responseMsg.ID,
+								responseMsg, err = session.ChannelMessageEdit(responseMsg.ChannelID, responseMsg.ID,
 									fmt.Sprintf("**Command — History**\n\n%s", status))
 							} else {
-								responseMsg, err = bot.ChannelMessageEditComplex(&discordgo.MessageEdit{
+								responseMsg, err = session.ChannelMessageEditComplex(&discordgo.MessageEdit{
 									ID:      responseMsg.ID,
 									Channel: responseMsg.ChannelID,
 									Embed:   buildEmbed(responseMsg.ChannelID, "Command — History", status),
@@ -846,7 +878,8 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 						break MessageRequestingLoop
 					}
 				}
-				if messages, fetcherr := bot.ChannelMessages(channel.ID, config.HistoryRequestCount, beforeID, sinceID, ""); fetcherr != nil {
+				messageRequestCount++
+				if messages, fetcherr := session.ChannelMessages(channel.ID, config.HistoryRequestCount, beforeID, sinceID, ""); fetcherr != nil {
 					// Error requesting messages
 					if sendStatus {
 						if !hasPermsToRespond {
@@ -885,7 +918,7 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 					// Process Messages
 					if sourceConfig.HistoryTyping != nil && !autorun {
 						if *sourceConfig.HistoryTyping && hasPermsToRespond {
-							bot.ChannelTyping(commandingMessage.ChannelID)
+							session.ChannelTyping(commandingMessage.ChannelID)
 						}
 					}
 					messagesToProcess := make([]*discordgo.Message, 0, len(messages))
@@ -918,12 +951,24 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 						}
 						messagesToProcess = append(messagesToProcess, message)
 					}
-					downloadCount, downloadSize, downloadDuration := processHistoryMessageBatch(messagesToProcess, &channel, effectiveHistoryDownloadWorkers())
+					downloadCount, downloadSize, downloadDuration, batchComplete := processHistoryMessageBatch(messagesToProcess, &channel, effectiveHistoryDownloadWorkers())
 					totalDownloads += downloadCount
 					totalFilesize += downloadSize
 					historyDownloadDuration += downloadDuration
 					totalMessages += int64(len(messagesToProcess))
 					historyJobs.SetProgress(subjectChannelID, totalDownloads, totalFilesize)
+					if !batchComplete || historyAbortRequested(subjectChannelID) {
+						channelStatus = historyStatusErrorDownloading
+						if historyAbortRequested(subjectChannelID) {
+							channelStatus = historyStatusAbortCompleted
+							stopAllChannels = true
+						}
+						if useIncrementalCheckpoint {
+							channelCache.RunningBefore = pageBefore
+							writeHistoryCache(channel.ID, channelCache)
+						}
+						break MessageRequestingLoop
+					}
 					if reachedSinceBoundary || len(messages) < config.HistoryRequestCount {
 						completeIncrementalCache()
 						if !reachedSinceBoundary {
@@ -989,10 +1034,10 @@ func handleHistory(commandingMessage *discordgo.Message, subjectChannelID string
 						}
 					} else {
 						if selfbot {
-							responseMsg, err = bot.ChannelMessageEdit(responseMsg.ChannelID, responseMsg.ID,
+							responseMsg, err = session.ChannelMessageEdit(responseMsg.ChannelID, responseMsg.ID,
 								fmt.Sprintf("**Command — History**\n\n%s", status))
 						} else {
-							responseMsg, err = bot.ChannelMessageEditComplex(&discordgo.MessageEdit{
+							responseMsg, err = session.ChannelMessageEditComplex(&discordgo.MessageEdit{
 								ID:      responseMsg.ID,
 								Channel: responseMsg.ChannelID,
 								Embed:   buildEmbed(responseMsg.ChannelID, "Command — History", status),

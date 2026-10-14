@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml"><img src="https://github.com/Halo1211/discord-downloader-go-gui/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
-  <a href="https://github.com/Halo1211/discord-downloader-go-gui/releases/latest"><img src="https://img.shields.io/github/v/release/Halo1211/discord-downloader-go-gui?display_name=tag&sort=semver" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Halo1211/discord-downloader-go-gui" alt="License"></a>
 </p>
 
@@ -72,11 +71,9 @@ the required permissions.
 
 Download the single Windows amd64 executable from the
 [latest GitHub release](https://github.com/Halo1211/discord-downloader-go-gui/releases/latest).
-Extract it to a dedicated application directory. Do not run the program from a
-directory containing unrelated personal files.
-
-The local `release/` directory used by maintainers is ignored by Git and is
-not part of the source repository.
+Extract it to a dedicated application directory. Rename the executable to
+`discord-downloader-go-gui.exe` to use the commands below. Do not run the
+program from a directory containing unrelated personal files.
 
 ### 3. Configure the bot
 
@@ -84,10 +81,10 @@ Copy [`settings.example.json`](settings.example.json) to `settings.json`, then
 set the bot token and destination folder. The application creates a complete
 settings file with defaults when no settings file exists.
 
-On Windows, start the GUI executable:
+On Windows, start the GUI executable from that directory:
 
 ```powershell
-discord-downloader-go-gui.exe
+.\discord-downloader-go-gui.exe
 ```
 
 The dashboard listens on `127.0.0.1:7744` by default. Review the settings and
@@ -97,7 +94,7 @@ should start the runtime without a button press.
 For a headless or terminal-only deployment:
 
 ```powershell
-discord-downloader-go-gui.exe --no-gui
+.\discord-downloader-go-gui.exe --no-gui
 ```
 
 The GUI can also be opened in the system browser with `--gui-browser`. Useful
@@ -112,7 +109,7 @@ options include `--gui-address=127.0.0.1:8899`, `--no-gui-open`, `--no-tray`,
 - [History Guide](docs/HISTORY.md) — archive scans, checkpoints, cancellation, and recovery.
 - [Wiki hub](wiki/Home.md) — the complete guide set, including examples and troubleshooting.
 - [Architecture Map](ARCHITECTURE.md) — runtime flow, state boundaries, and persistence.
-- [Release Notes](RELEASE_NOTES.md) — changes included in the current release.
+- [Release Notes](RELEASE_NOTES.md) — changes planned for v1.0.1 and previous releases.
 
 ## Reliability and security defaults
 

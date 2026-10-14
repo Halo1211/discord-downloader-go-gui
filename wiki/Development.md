@@ -2,7 +2,7 @@
 
 ## Local checks
 
-Go 1.24.1 or newer is recommended. From the repository root run:
+Go 1.24.1 or newer is required. From the repository root run:
 
 ```powershell
 go test ./...
@@ -10,9 +10,9 @@ go vet ./...
 go build ./...
 ```
 
-The release workflow builds one Windows amd64 executable with CGO disabled
-and publishes it when a `v*` tag is pushed. The maintainer's local `release/`
-directory is intentionally ignored by Git.
+CI runs on branch pushes and pull requests. The release workflow builds one
+Windows amd64 executable with CGO disabled and publishes it when a `v*` tag is
+pushed.
 
 ## Documentation changes
 

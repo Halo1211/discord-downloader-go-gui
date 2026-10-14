@@ -1,43 +1,38 @@
-# Release Notes — v1.0.0
+# Release Notes
 
-This release packages the maintained GUI fork at
-`Halo1211/discord-downloader-go-gui`.
+## v1.0.1 (pending release)
 
-## Presentation
+This maintenance update improves download, history, configuration, and GUI
+behavior. It also adds regression coverage for the bugs fixed since v1.0.0.
 
-- Refreshed the README with a dashboard preview, release badges, and a new repository logo.
-- Added a clean vector logo asset that can be reused in project documentation and packaging.
-- Embedded the repository logo directly into the desktop dashboard so the program is self-contained.
-- The embedded logo adapts its colors to the selected dashboard theme.
-- Expanded `settings.example.json` with safe, detailed examples for global and scoped rules.
-- Expanded the English version-controlled wiki with code-accurate commands,
-  configuration reference, CLI/GUI security guidance, history recovery,
-  troubleshooting, official Discord references, and attributed historical media.
+### Fixes
 
-## Highlights
+- Handle incomplete Discord events and temporary disconnects without stopping
+  downloads, commands, or message logging.
+- Apply source scope and blacklist rules consistently, and keep admin-only
+  history status private.
+- Coordinate pending downloads with duplicate checks and history scans so a
+  file is not skipped before its database record is committed.
+- Preserve history cancellation and checkpoints when a scan is interrupted or
+  a channel lookup fails.
+- Report settings read/write failures accurately and preserve existing secrets
+  when saving through the GUI.
+- Reject malformed GUI addresses and unsafe date inputs; keep resolver API keys
+  out of HTTP error messages.
 
-- Windows WebView2 dashboard with optional browser fallback.
-- System-tray hide/restore flow with safe exit confirmation.
-- Searchable Normal and Advanced settings editor.
-- Token-protected loopback GUI API with masked credentials and atomic settings
-  backups.
-- Bounded real-time and history worker queues.
-- Retry backoff, redirect limits, response-size limits, and HTTP connection
-  reuse.
-- Atomic download and history checkpoint writes.
-- Resumable history jobs with cancellation and per-channel high-water marks.
-- Discord API v10 endpoint compatibility and DiscordGo v0.29.
-- GitHub Actions CI and tag-based single-executable Windows release builds.
+### Documentation and CI
 
-The release distribution intentionally contains one Windows amd64 executable
-to keep the desktop download simple. This release starts the maintained GUI
-fork's version line at `v1.0.0`.
+- Keep the user guides in English and make executable names consistent across
+  the README, getting-started guides, and release workflow.
+- Remove obsolete tutorial media and duplicate documentation.
+- Run CI on branch pushes as well as pull requests.
 
-## Upgrade notes
+No configuration migration is required. Back up `settings.json` and `database/`
+before upgrading, especially before a large history scan.
 
-Existing JSON/YAML settings remain supported. The first run can import a legacy
-`config.ini`, but a bot token is the recommended authentication method. Review
-the generated settings file before starting a large archive.
+## v1.0.0
 
-The local maintainer bundle is generated under `release/`. That directory is
-explicitly ignored by Git and must not be committed.
+The first release of the maintained GUI fork added the Windows dashboard,
+loopback API, resumable history jobs, bounded download queues, and a single
+Windows amd64 executable. Earlier `v2.6.x` tags belong to the project's
+previous version line; this fork restarted its version line at v1.0.0.

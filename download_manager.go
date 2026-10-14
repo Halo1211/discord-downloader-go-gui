@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"sync"
+	"time"
 )
 
 // downloadManager provides bounded backpressure for real-time message events.
@@ -18,6 +20,7 @@ type downloadManager struct {
 	active     sync.WaitGroup
 	stopped    bool
 	inFlight   map[string]struct{}
+	finished   map[string]chan struct{}
 }
 
 var (
@@ -120,6 +123,10 @@ func (m *downloadManager) submit(request downloadRequestStruct) bool {
 		return true
 	}
 	m.inFlight[key] = struct{}{}
+	if m.finished == nil {
+		m.finished = make(map[string]chan struct{})
+	}
+	m.finished[key] = make(chan struct{})
 	m.active.Add(1)
 	m.mu.Unlock()
 	defer m.submitters.Done()
@@ -133,6 +140,10 @@ func (m *downloadManager) release(key string) {
 	_, existed := m.inFlight[key]
 	if existed {
 		delete(m.inFlight, key)
+		if done := m.finished[key]; done != nil {
+			close(done)
+			delete(m.finished, key)
+		}
 	}
 	m.mu.Unlock()
 	if existed {
@@ -154,6 +165,10 @@ func (m *downloadManager) reserve(inputURL, channelID string) bool {
 		return false
 	}
 	m.inFlight[key] = struct{}{}
+	if m.finished == nil {
+		m.finished = make(map[string]chan struct{})
+	}
+	m.finished[key] = make(chan struct{})
 	m.active.Add(1)
 	return true
 }
@@ -164,10 +179,30 @@ func runHistoryDownload(request downloadRequestStruct) (downloadStatusStruct, in
 		return request.handleDownload()
 	}
 	key := downloadRequestQueueKey(request)
-	if !manager.reserve(request.InputURL, downloadRequestChannelID(request)) {
-		return mDownloadStatus(downloadSkippedDuplicate), 0
+	for !manager.reserve(request.InputURL, downloadRequestChannelID(request)) {
+		manager.mu.Lock()
+		stopped, done := manager.stopped, manager.finished[key]
+		manager.mu.Unlock()
+		if stopped || historyAbortRequested(downloadRequestChannelID(request)) {
+			return mDownloadStatus(downloadFailedRequesting, errors.New("history download interrupted")), 0
+		}
+		if done == nil {
+			continue
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-done:
+		case <-runtimeBackgroundStop:
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
 	defer manager.release(key)
+	source := getSource(request.Message)
+	allowDuplicates := source.SavePossibleDuplicates != nil && *source.SavePossibleDuplicates
+	if !allowDuplicates && dbHasDownload(request.InputURL, downloadRequestChannelID(request)) {
+		return mDownloadStatus(downloadSkippedDuplicate), 0
+	}
 	return request.handleDownload()
 }
 

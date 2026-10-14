@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -31,11 +32,11 @@ func properExit() {
 func getJSON(url string, target interface{}) error {
 	r, err := jsonHTTPClient.Get(url)
 	if err != nil {
-		return err
+		return safeJSONRequestError(url, err)
 	}
 	defer r.Body.Close()
 	if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("GET %s: unexpected HTTP status %s", url, r.Status)
+		return fmt.Errorf("GET %s: unexpected HTTP status %s", safeJSONEndpoint(url), r.Status)
 	}
 
 	return json.NewDecoder(r.Body).Decode(target)
@@ -44,7 +45,7 @@ func getJSON(url string, target interface{}) error {
 func getJSONwithHeaders(url string, target interface{}, headers map[string]string) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return safeJSONRequestError(url, err)
 	}
 
 	for k, v := range headers {
@@ -53,14 +54,31 @@ func getJSONwithHeaders(url string, target interface{}, headers map[string]strin
 
 	r, err := jsonHTTPClient.Do(req)
 	if err != nil {
-		return err
+		return safeJSONRequestError(url, err)
 	}
 	defer r.Body.Close()
 	if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("GET %s: unexpected HTTP status %s", url, r.Status)
+		return fmt.Errorf("GET %s: unexpected HTTP status %s", safeJSONEndpoint(url), r.Status)
 	}
 
 	return json.NewDecoder(r.Body).Decode(target)
+}
+
+func safeJSONEndpoint(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "request URL"
+	}
+	return parsed.Scheme + "://" + parsed.Hostname() + parsed.EscapedPath()
+}
+
+func safeJSONRequestError(rawURL string, err error) error {
+	parsed, parseErr := url.Parse(rawURL)
+	if parseErr != nil || parsed.RawQuery != "" || parsed.User != nil {
+		// HTTP client's url.Error includes the full URL, including API keys.
+		return fmt.Errorf("GET %s: request failed (%T)", safeJSONEndpoint(rawURL), err)
+	}
+	return err
 }
 
 //#region Github

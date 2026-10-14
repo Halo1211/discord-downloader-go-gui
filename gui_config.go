@@ -176,7 +176,8 @@ func guiRedactConfigurationSecrets(candidate *configuration) map[string]bool {
 
 func guiPreserveConfigurationSecrets(candidate *configuration, current configuration) {
 	preserve := func(value *string, old string) {
-		if strings.TrimSpace(*value) == "" && strings.TrimSpace(old) != "" {
+		trimmed := strings.TrimSpace(*value)
+		if (trimmed == "" || trimmed == placeholderToken || trimmed == placeholderEmail || trimmed == placeholderPassword) && strings.TrimSpace(old) != "" {
 			*value = old
 		}
 	}
@@ -191,12 +192,15 @@ func guiPreserveConfigurationSecrets(candidate *configuration, current configura
 	preserve(&candidate.Credentials.InstagramPassword, current.Credentials.InstagramPassword)
 	preserve(&candidate.Credentials.InstagramProxy, current.Credentials.InstagramProxy)
 	preserve(&candidate.Credentials.FlickrApiKey, current.Credentials.FlickrApiKey)
-	if candidate.Credentials.InstagramTOTP == nil && current.Credentials.InstagramTOTP != nil {
+	if (candidate.Credentials.InstagramTOTP == nil || strings.TrimSpace(*candidate.Credentials.InstagramTOTP) == "") && current.Credentials.InstagramTOTP != nil {
 		candidate.Credentials.InstagramTOTP = current.Credentials.InstagramTOTP
 	}
 }
 
 func guiValidateConfiguration(candidate configuration) error {
+	if candidate.CheckupRate < 1 || candidate.PresenceRefreshRate < 1 || candidate.ConnectionCheckRate < 1 || candidate.HistoryManagerRate < 1 {
+		return errors.New("checkupRate, presenceRefreshRate, connectionCheckRate and historyManagerRate must be positive")
+	}
 	if candidate.DownloadWorkers < 1 || candidate.DownloadWorkers > maxConfigDownloadWorkers {
 		return fmt.Errorf("downloadWorkers must be between 1 and %d", maxConfigDownloadWorkers)
 	}

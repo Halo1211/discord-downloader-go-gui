@@ -76,5 +76,5 @@ backups/                       # optional dated database zip files
 <archive destination>/         # downloaded files
 ```
 
-The local maintainer-only `release/` bundle is ignored by Git. GitHub releases
-contain one Windows amd64 executable; configuration and archives stay local.
+GitHub releases contain one Windows amd64 executable; configuration and
+archives stay local.
